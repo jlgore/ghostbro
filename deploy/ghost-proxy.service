@@ -1,0 +1,63 @@
+# Ghost Proxy server — hardened systemd unit (PRD §13.4).
+#
+# This realizes the "proxy runs as an unprivileged user; only the eBPF loader
+# needs CAP_BPF / CAP_NET_ADMIN" requirement: the daemon never runs as root.
+# systemd starts it as the `ghost-proxy` user with exactly the ambient
+# capabilities the eBPF loader and the :443 decoy bind require, and nothing else.
+#
+# Setup:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ghost-proxy
+#   sudo install -Dm755 target/release/ghost-proxy-server /usr/local/bin/ghost-proxy-server
+#   sudo install -Dm644 target/bpfel-unknown-none/release/ghost-proxy-ebpf \
+#       /usr/local/lib/ghost-proxy/ghost-proxy-ebpf
+#   # /var/lib/ghost-proxy (relay spool, counters) and /var/log/ghost-proxy are
+#   # created and owned by the service user via StateDirectory/LogsDirectory below.
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ghost-proxy
+
+[Unit]
+Description=Ghost Proxy server (SPA + Noise IK proxy + eBPF XDP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ghost-proxy-server \
+    --config /etc/ghost-proxy/ghost-proxy.toml \
+    --iface eth0 \
+    --ebpf-object /usr/local/lib/ghost-proxy/ghost-proxy-ebpf
+Restart=on-failure
+RestartSec=5
+
+# --- Run unprivileged with only the capabilities the loader needs ---
+User=ghost-proxy
+Group=ghost-proxy
+# CAP_BPF: load/attach XDP + read/write BPF maps (allow-map, ring buffer).
+# CAP_NET_ADMIN: attach the XDP program to the interface via netlink.
+# CAP_NET_BIND_SERVICE: bind the builtin decoy on :443 (drop if decoy >1024 or behind nginx).
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# --- Writable state, everything else read-only ---
+StateDirectory=ghost-proxy
+LogsDirectory=ghost-proxy
+ReadWritePaths=/var/lib/ghost-proxy /var/log/ghost-proxy
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# --- Kernel / namespace / syscall hardening ---
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_NETLINK AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @bpf
+# Note: MemoryDenyWriteExecute is intentionally left unset — the eBPF JIT needs
+# W^X exceptions and enabling it can break BPF program loading.
+
+[Install]
+WantedBy=multi-user.target
