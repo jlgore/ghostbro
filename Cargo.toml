@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "ghost-proxy-bpf-common",
+    "ghost-proxy-common",
+    "ghost-proxy-client",
+    "ghost-proxy-server",
+    "ghost-proxy-ebpf",
+    "xtask",
+]
+default-members = [
+    "ghost-proxy-bpf-common",
+    "ghost-proxy-common",
+    "ghost-proxy-client",
+    "ghost-proxy-server",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5"
+aya = "0.13.1"
+aya-log = "0.2"
+axum = "0.8"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+fast-socks5 = "1.0.0"
+httpdate = "1"
+ipnet = "2"
+libc = "0.2"
+notify = "8"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rpassword = "7"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+snow = "0.9"
+thiserror = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio-rustls = "0.26"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

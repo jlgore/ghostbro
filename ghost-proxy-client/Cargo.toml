@@ -1,0 +1,29 @@
+[package]
+name = "ghost-proxy-client"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "ghost-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+fast-socks5.workspace = true
+ghost-proxy-common = { path = "../ghost-proxy-common" }
+httpdate.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+snow.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
