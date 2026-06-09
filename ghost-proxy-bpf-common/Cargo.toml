@@ -1,0 +1,12 @@
+[package]
+name = "ghost-proxy-bpf-common"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+aya = { workspace = true, optional = true }
+
+[features]
+default = []
+user = ["aya"]
