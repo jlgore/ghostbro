@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast userspace gate on stable. `cargo {fmt,clippy,test}` resolve to the
+  # workspace default-members (server, client, common, bpf-common), so the
+  # nightly-only eBPF crate is intentionally NOT pulled in here — never use
+  # `--workspace` on stable, it fails to compile ghost-proxy-ebpf.
+  check:
+    name: fmt + clippy + test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test
+
+  # The eBPF object is a separate toolchain: nightly + rust-src (-Z build-std)
+  # + bpf-linker, built for the bpfel-unknown-none target via the xtask helper.
+  ebpf:
+    name: eBPF build (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: bpfel-unknown-none
+
+      - uses: Swatinem/rust-cache@v2
+
+      # bpf-linker is the linker aya uses for the BPF target. Installed fresh
+      # each run so it always matches the floating nightly's LLVM; if this
+      # dominates CI time, cache ~/.cargo/bin/bpf-linker keyed on the nightly date.
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Build eBPF object
+        run: cargo xtask build-ebpf
+
+      - name: Upload eBPF object
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-proxy-ebpf
+          path: target/bpfel-unknown-none/release/ghost-proxy-ebpf
+          if-no-files-found: error

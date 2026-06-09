@@ -1,0 +1,61 @@
+name: Release
+
+# Fires on a version tag, e.g. `git tag v0.2.0 && git push --tags`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build + publish (x86_64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Userspace release binaries (stable) ---
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build server + client
+        run: cargo build --release -p ghost-proxy-server -p ghost-proxy-client
+
+      # --- eBPF object (nightly + bpf-linker) ---
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: bpfel-unknown-none
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+      - name: Build eBPF object
+        run: cargo xtask build-ebpf
+
+      # --- Package: binaries + eBPF object + unit + docs, with checksums ---
+      - name: Package release
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          PKG="ghost-proxy-${VERSION}-x86_64-linux"
+          mkdir -p "dist/${PKG}"
+          cp target/release/ghost-proxy-server "dist/${PKG}/"
+          cp target/release/ghost-proxy        "dist/${PKG}/ghost-proxy-client"
+          cp target/bpfel-unknown-none/release/ghost-proxy-ebpf "dist/${PKG}/"
+          cp deploy/ghost-proxy.service "dist/${PKG}/"
+          cp README.md PRD.md "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
