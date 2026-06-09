@@ -134,6 +134,10 @@ enum Command {
         /// Path to encrypted or legacy plaintext Ed25519 identity key from `keygen`.
         #[arg(long)]
         identity_key: String,
+        /// Path to the destination server's Noise public key file. Bound into the
+        /// SPA signature (not transmitted) so the packet only opens this server.
+        #[arg(long)]
+        server_key: String,
         /// UDP SPA endpoint, e.g. 127.0.0.1:53.
         #[arg(long)]
         endpoint: SocketAddr,
@@ -146,6 +150,10 @@ enum Command {
         /// Path to encrypted or legacy plaintext Ed25519 identity key from `keygen`.
         #[arg(long)]
         identity_key: String,
+        /// Path to the destination server's Noise public key file. Bound into the
+        /// SPA signature (not transmitted) so the packet only opens this server.
+        #[arg(long)]
+        server_key: String,
         /// HTTPS SPA endpoint URL, e.g. https://example.com/api/v1/telemetry.
         #[arg(long)]
         url: String,
@@ -552,14 +560,32 @@ fn main() -> Result<()> {
         } => revoke(&config, identity_key.as_deref()),
         Command::SendUdpSpa {
             identity_key,
+            server_key,
             endpoint,
             counter_file,
-        } => send_udp_spa(&identity_key, endpoint, counter_file.as_deref()),
+        } => {
+            let server_static_pubkey = read_noise_public_key_array(&server_key)?;
+            send_udp_spa(
+                &identity_key,
+                &server_static_pubkey,
+                endpoint,
+                counter_file.as_deref(),
+            )
+        }
         Command::SendHttpsSpa {
             identity_key,
+            server_key,
             url,
             counter_file,
-        } => send_https_spa(&identity_key, &url, counter_file.as_deref()),
+        } => {
+            let server_static_pubkey = read_noise_public_key_array(&server_key)?;
+            send_https_spa(
+                &identity_key,
+                &server_static_pubkey,
+                &url,
+                counter_file.as_deref(),
+            )
+        }
         Command::ConnectOnce {
             identity_key,
             server_key,
@@ -1024,6 +1050,7 @@ fn revoke_request_body(request: &RevokeRequest<'_>) -> String {
 
 fn send_udp_spa(
     identity_key: &str,
+    server_static_pubkey: &[u8; 32],
     endpoint: SocketAddr,
     counter_file: Option<&str>,
 ) -> Result<()> {
@@ -1033,7 +1060,13 @@ fn send_udp_spa(
         .unwrap_or_else(|| default_counter_path(identity_key));
     let counter = increment_counter(&counter_path)?;
     let timestamp_ms = unix_timestamp_ms()?;
-    let payload = SpaPacket::build(&signing_key, SpaMode::Udp, timestamp_ms, counter);
+    let payload = SpaPacket::build(
+        &signing_key,
+        SpaMode::Udp,
+        timestamp_ms,
+        counter,
+        server_static_pubkey,
+    );
 
     let socket = UdpSocket::bind(if endpoint.is_ipv4() {
         "0.0.0.0:0"
@@ -1055,14 +1088,25 @@ fn send_udp_spa(
     Ok(())
 }
 
-fn send_https_spa(identity_key: &str, url: &str, counter_file: Option<&str>) -> Result<()> {
+fn send_https_spa(
+    identity_key: &str,
+    server_static_pubkey: &[u8; 32],
+    url: &str,
+    counter_file: Option<&str>,
+) -> Result<()> {
     let signing_key = read_signing_key(identity_key)?;
     let counter_path = counter_file
         .map(PathBuf::from)
         .unwrap_or_else(|| default_counter_path(identity_key));
     let counter = increment_counter(&counter_path)?;
     let timestamp_ms = unix_timestamp_ms()?;
-    let payload = SpaPacket::build(&signing_key, SpaMode::Https, timestamp_ms, counter);
+    let payload = SpaPacket::build(
+        &signing_key,
+        SpaMode::Https,
+        timestamp_ms,
+        counter,
+        server_static_pubkey,
+    );
 
     let response = reqwest::blocking::Client::new()
         .post(url)
@@ -1176,8 +1220,10 @@ fn connect_once(
     https_spa_url: Option<&str>,
     counter_file: Option<&str>,
 ) -> Result<()> {
+    let server_static_pubkey = read_noise_public_key_array(server_key)?;
     send_spa(
         identity_key,
+        &server_static_pubkey,
         spa_endpoint,
         spa_mode,
         https_spa_url,
@@ -1697,13 +1743,19 @@ fn start_spa_refresh(
             if let Some(candidate) = candidates.get(candidate_index) {
                 let result = {
                     let _counter_guard = counter_lock.lock().expect("counter lock poisoned");
-                    send_spa(
-                        &identity_key,
-                        candidate.spa_endpoint,
-                        candidate.spa_mode,
-                        candidate.https_spa_url.as_deref(),
-                        counter_file.as_deref(),
-                    )
+                    match <[u8; 32]>::try_from(candidate.server_public_key.as_slice()) {
+                        Ok(server_static_pubkey) => send_spa(
+                            &identity_key,
+                            &server_static_pubkey,
+                            candidate.spa_endpoint,
+                            candidate.spa_mode,
+                            candidate.https_spa_url.as_deref(),
+                            counter_file.as_deref(),
+                        ),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "server Noise public key must be 32 bytes"
+                        )),
+                    }
                 };
 
                 match result {
@@ -1967,8 +2019,12 @@ fn connect_noise(
     Vec<u8>,
     ghost_proxy_common::keys::KeyId,
 )> {
+    let server_static_pubkey: [u8; 32] = server_public_key
+        .try_into()
+        .context("server Noise public key must be 32 bytes")?;
     send_spa(
         identity_key,
+        &server_static_pubkey,
         spa_endpoint,
         spa_mode,
         https_spa_url,
@@ -2141,16 +2197,19 @@ fn spa_authorization_hint() -> String {
 
 fn send_spa(
     identity_key: &str,
+    server_static_pubkey: &[u8; 32],
     spa_endpoint: SocketAddr,
     spa_mode: SpaTransport,
     https_spa_url: Option<&str>,
     counter_file: Option<&str>,
 ) -> Result<()> {
     match spa_mode {
-        SpaTransport::Udp => send_udp_spa(identity_key, spa_endpoint, counter_file),
+        SpaTransport::Udp => {
+            send_udp_spa(identity_key, server_static_pubkey, spa_endpoint, counter_file)
+        }
         SpaTransport::Https => {
             let url = https_spa_url.context("--https-spa-url is required when --spa-mode https")?;
-            send_https_spa(identity_key, url, counter_file)
+            send_https_spa(identity_key, server_static_pubkey, url, counter_file)
         }
     }
 }
@@ -2258,6 +2317,15 @@ fn read_noise_public_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
             path.display()
         )
     })
+}
+
+/// Read the server's Noise public key as a fixed 32-byte array, for binding into
+/// SPA signatures (authenticated associated data, not transmitted on the wire).
+fn read_noise_public_key_array(path: impl AsRef<Path>) -> Result<[u8; 32]> {
+    let key = read_noise_public_key(path)?;
+    key.as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("server Noise public key must be 32 bytes, got {}", key.len()))
 }
 
 fn decode_noise_public_key(encoded: &str) -> Result<Vec<u8>> {

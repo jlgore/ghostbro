@@ -69,6 +69,7 @@ impl SpaPacket {
         mode: SpaMode,
         timestamp_ms: u64,
         counter: u64,
+        server_static_pubkey: &[u8; 32],
     ) -> Vec<u8> {
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
@@ -77,8 +78,16 @@ impl SpaPacket {
         let mut padding = vec![0u8; padding_len];
         OsRng.fill_bytes(&mut padding);
 
-        Self::build_with_padding(signing_key, mode, timestamp_ms, counter, nonce, &padding)
-            .expect("random padding length is valid")
+        Self::build_with_padding(
+            signing_key,
+            mode,
+            timestamp_ms,
+            counter,
+            nonce,
+            &padding,
+            server_static_pubkey,
+        )
+        .expect("random padding length is valid")
     }
 
     pub fn build_with_padding(
@@ -88,6 +97,7 @@ impl SpaPacket {
         counter: u64,
         nonce: [u8; NONCE_LEN],
         padding: &[u8],
+        server_static_pubkey: &[u8; 32],
     ) -> Result<Vec<u8>, SpaError> {
         if SPA_MIN_LEN + padding.len() > SPA_MAX_LEN {
             return Err(SpaError::InvalidPaddingLength);
@@ -104,7 +114,12 @@ impl SpaPacket {
         packet.extend_from_slice(&counter.to_be_bytes());
         packet.extend_from_slice(&nonce);
 
-        let signature = signing_key.sign(&packet);
+        // Bind the destination server's Noise static public key into the
+        // signature without transmitting it: it is authenticated associated
+        // data, not part of the 107..=128-byte on-wire payload. This prevents a
+        // SPA accepted by one server from verifying on another (cross-server
+        // replay / failover replay).
+        let signature = signing_key.sign(&signed_message(&packet, server_static_pubkey));
         packet.extend_from_slice(&signature.to_bytes());
         packet.extend_from_slice(padding);
 
@@ -140,16 +155,33 @@ impl SpaPacket {
         })
     }
 
-    pub fn verify(&self, payload: &[u8], verifying_key: &VerifyingKey) -> Result<(), SpaError> {
+    pub fn verify(
+        &self,
+        payload: &[u8],
+        verifying_key: &VerifyingKey,
+        server_static_pubkey: &[u8; 32],
+    ) -> Result<(), SpaError> {
         if payload.len() < SPA_MIN_LEN || payload.len() > SPA_MAX_LEN {
             return Err(SpaError::InvalidLength(payload.len()));
         }
 
         let signature = Signature::from_bytes(&self.signature);
         verifying_key
-            .verify(&payload[..SPA_SIGNED_LEN], &signature)
+            .verify(
+                &signed_message(&payload[..SPA_SIGNED_LEN], server_static_pubkey),
+                &signature,
+            )
             .map_err(|_| SpaError::BadSignature)
     }
+}
+
+/// The Ed25519-signed message: the on-wire signed region followed by the
+/// destination server's Noise static public key (authenticated, not transmitted).
+fn signed_message(signed_region: &[u8], server_static_pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(signed_region.len() + server_static_pubkey.len());
+    message.extend_from_slice(signed_region);
+    message.extend_from_slice(server_static_pubkey);
+    message
 }
 
 fn read_array<const N: usize>(payload: &[u8], offset: &mut usize) -> [u8; N] {
@@ -168,6 +200,9 @@ mod tests {
     use super::*;
     use crate::keys::generate_ed25519_keypair;
 
+    const SERVER_PUBKEY_A: [u8; 32] = [0xAu8; 32];
+    const SERVER_PUBKEY_B: [u8; 32] = [0xBu8; 32];
+
     #[test]
     fn builds_parses_and_verifies_udp_packet() {
         let signing_key = generate_ed25519_keypair();
@@ -178,6 +213,7 @@ mod tests {
             42,
             [7u8; NONCE_LEN],
             &[1, 2, 3],
+            &SERVER_PUBKEY_A,
         )
         .expect("valid packet");
 
@@ -189,28 +225,65 @@ mod tests {
         assert_eq!([7u8; NONCE_LEN], packet.nonce);
         assert_eq!(vec![1, 2, 3], packet.padding);
         packet
-            .verify(&payload, &signing_key.verifying_key())
+            .verify(&payload, &signing_key.verifying_key(), &SERVER_PUBKEY_A)
             .expect("signature verifies");
+    }
+
+    #[test]
+    fn rejects_packet_built_for_different_server() {
+        // A SPA built to open server A's gate must NOT verify against server B's
+        // identity — this defeats cross-server / failover replay (F-003).
+        let signing_key = generate_ed25519_keypair();
+        let payload = SpaPacket::build(
+            &signing_key,
+            SpaMode::Udp,
+            1_725_000_000_000,
+            42,
+            &SERVER_PUBKEY_A,
+        );
+
+        let packet = SpaPacket::parse(&payload).expect("structurally valid packet");
+
+        packet
+            .verify(&payload, &signing_key.verifying_key(), &SERVER_PUBKEY_A)
+            .expect("verifies for the server it was built for");
+
+        assert_eq!(
+            Err(SpaError::BadSignature),
+            packet.verify(&payload, &signing_key.verifying_key(), &SERVER_PUBKEY_B)
+        );
     }
 
     #[test]
     fn detects_signature_tampering() {
         let signing_key = generate_ed25519_keypair();
-        let mut payload = SpaPacket::build(&signing_key, SpaMode::Https, 1_725_000_000_000, 42);
+        let mut payload = SpaPacket::build(
+            &signing_key,
+            SpaMode::Https,
+            1_725_000_000_000,
+            42,
+            &SERVER_PUBKEY_A,
+        );
         payload[20] ^= 0xff;
 
         let packet = SpaPacket::parse(&payload).expect("structurally valid packet");
 
         assert_eq!(
             Err(SpaError::BadSignature),
-            packet.verify(&payload, &signing_key.verifying_key())
+            packet.verify(&payload, &signing_key.verifying_key(), &SERVER_PUBKEY_A)
         );
     }
 
     #[test]
     fn rejects_reserved_flags() {
         let signing_key = generate_ed25519_keypair();
-        let mut payload = SpaPacket::build(&signing_key, SpaMode::Udp, 1_725_000_000_000, 42);
+        let mut payload = SpaPacket::build(
+            &signing_key,
+            SpaMode::Udp,
+            1_725_000_000_000,
+            42,
+            &SERVER_PUBKEY_A,
+        );
         payload[2] = 0b0000_0010;
 
         assert_eq!(Err(SpaError::InvalidFlags(2)), SpaPacket::parse(&payload));

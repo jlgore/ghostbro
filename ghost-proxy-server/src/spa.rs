@@ -20,6 +20,7 @@ pub struct SpaVerifier {
     highest_counters: HashMap<KeyId, u64>,
     time_window_ms: u64,
     counter_state_path: Option<PathBuf>,
+    server_static_pubkey: [u8; 32],
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -54,22 +55,43 @@ pub enum SpaVerifyError {
 }
 
 impl SpaVerifier {
-    pub fn new(clients: Vec<AuthorizedClient>, time_window_seconds: u64) -> Self {
-        Self::from_counters(clients, time_window_seconds, HashMap::new(), None)
+    pub fn new(
+        clients: Vec<AuthorizedClient>,
+        time_window_seconds: u64,
+        server_static_pubkey: [u8; 32],
+    ) -> Self {
+        Self::from_counters(
+            clients,
+            time_window_seconds,
+            HashMap::new(),
+            None,
+            server_static_pubkey,
+        )
     }
 
+    /// Load a verifier, restoring persisted replay counters from
+    /// `counter_state_path`.
+    ///
+    /// A missing counter-state file is treated as a hard error (fail closed)
+    /// unless `allow_missing_state` is set, because losing the file silently
+    /// resets every per-key counter to zero and lets previously captured SPA
+    /// packets replay. `allow_missing_state` is the operator-controlled
+    /// first-run / provisioning opt-in.
     pub fn load(
         clients: Vec<AuthorizedClient>,
         time_window_seconds: u64,
         counter_state_path: impl AsRef<Path>,
+        server_static_pubkey: [u8; 32],
+        allow_missing_state: bool,
     ) -> anyhow::Result<Self> {
         let path = counter_state_path.as_ref().to_path_buf();
-        let highest_counters = load_counter_state(&path)?;
+        let highest_counters = load_counter_state(&path, allow_missing_state)?;
         Ok(Self::from_counters(
             clients,
             time_window_seconds,
             highest_counters,
             Some(path),
+            server_static_pubkey,
         ))
     }
 
@@ -78,6 +100,7 @@ impl SpaVerifier {
         time_window_seconds: u64,
         highest_counters: HashMap<KeyId, u64>,
         counter_state_path: Option<PathBuf>,
+        server_static_pubkey: [u8; 32],
     ) -> Self {
         let clients = clients
             .into_iter()
@@ -89,6 +112,7 @@ impl SpaVerifier {
             highest_counters,
             time_window_ms: time_window_seconds.saturating_mul(1_000),
             counter_state_path,
+            server_static_pubkey,
         }
     }
 
@@ -111,11 +135,14 @@ impl SpaVerifier {
             return Err(SpaVerifyError::UnknownKey(key_id_hex(&packet.key_id)));
         };
 
+        // Verify the signature before any authorization decision so the tier
+        // branch (and its distinguishable error) is unreachable without a valid
+        // signature — closes the unauthenticated key/tier enumeration oracle.
+        packet.verify(payload, &client.public_key, &self.server_static_pubkey)?;
+
         if client.tier != ClientTier::Full {
             return Err(SpaVerifyError::UnauthorizedTier(client.name.clone()));
         }
-
-        packet.verify(payload, &client.public_key)?;
 
         let drift = now_ms.abs_diff(packet.timestamp_ms);
         if drift > self.time_window_ms {
@@ -153,10 +180,22 @@ impl SpaVerifier {
     }
 }
 
-fn load_counter_state(path: &Path) -> anyhow::Result<HashMap<KeyId, u64>> {
+fn load_counter_state(
+    path: &Path,
+    allow_missing_state: bool,
+) -> anyhow::Result<HashMap<KeyId, u64>> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if allow_missing_state {
+                return Ok(HashMap::new());
+            }
+            return Err(anyhow::anyhow!(
+                "SPA counter-state file {} is missing; refusing to start with reset replay \
+                 counters. Set GHOST_PROXY_SPA_COUNTER_INIT=1 for an explicit first-run init.",
+                path.display()
+            ));
+        }
         Err(error) => return Err(Into::into(error)),
     };
 
@@ -212,6 +251,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_SERVER_PUBKEY: [u8; 32] = [0x5au8; 32];
+
     fn client_from_key(name: &str, signing_key: &SigningKey) -> AuthorizedClient {
         let public_key = signing_key.verifying_key();
         let key_id = ghost_proxy_common::keys::key_id_for_public_key(&public_key);
@@ -231,8 +272,9 @@ mod tests {
     fn accepts_valid_spa_once() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("jared-laptop", &signing_key);
-        let mut verifier = SpaVerifier::new(vec![client], 300);
-        let payload = SpaPacket::build(&signing_key, SpaMode::Udp, 1_000_000, 1);
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PUBKEY);
+        let payload =
+            SpaPacket::build(&signing_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
 
         let accepted = verifier.verify(&payload, 1_000_001).expect("accepted");
 
@@ -245,8 +287,9 @@ mod tests {
     fn rejects_replayed_counter() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("friend-phone", &signing_key);
-        let mut verifier = SpaVerifier::new(vec![client], 300);
-        let payload = SpaPacket::build(&signing_key, SpaMode::Https, 1_000_000, 1);
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PUBKEY);
+        let payload =
+            SpaPacket::build(&signing_key, SpaMode::Https, 1_000_000, 1, &TEST_SERVER_PUBKEY);
 
         verifier.verify(&payload, 1_000_001).expect("first use");
 
@@ -260,8 +303,9 @@ mod tests {
     fn rejects_timestamp_outside_window() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("friend-phone", &signing_key);
-        let mut verifier = SpaVerifier::new(vec![client], 300);
-        let payload = SpaPacket::build(&signing_key, SpaMode::Https, 1_000_000, 1);
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PUBKEY);
+        let payload =
+            SpaPacket::build(&signing_key, SpaMode::Https, 1_000_000, 1, &TEST_SERVER_PUBKEY);
 
         assert!(matches!(
             verifier.verify(&payload, 1_301_000),
@@ -270,24 +314,82 @@ mod tests {
     }
 
     #[test]
+    fn load_errors_on_missing_state_without_init() {
+        // F-007: a missing counter-state file must fail closed (no silent reset).
+        let signing_key = generate_ed25519_keypair();
+        let client = client_from_key("friend-phone", &signing_key);
+        let state_path = temp_counter_state_path();
+
+        let result =
+            SpaVerifier::load(vec![client], 300, &state_path, TEST_SERVER_PUBKEY, false);
+
+        assert!(
+            result.is_err(),
+            "missing counter-state file must fail closed without the init opt-in"
+        );
+        assert!(!state_path.exists());
+    }
+
+    #[test]
     fn persists_counter_state_across_verifier_reload() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("friend-phone", &signing_key);
         let state_path = temp_counter_state_path();
-        let payload = SpaPacket::build(&signing_key, SpaMode::Udp, 1_000_000, 7);
+        let payload =
+            SpaPacket::build(&signing_key, SpaMode::Udp, 1_000_000, 7, &TEST_SERVER_PUBKEY);
 
-        let mut verifier = SpaVerifier::load(vec![client.clone()], 300, &state_path)
-            .expect("verifier loads missing state");
+        let mut verifier =
+            SpaVerifier::load(vec![client.clone()], 300, &state_path, TEST_SERVER_PUBKEY, true)
+                .expect("verifier loads missing state on explicit init");
         verifier.verify(&payload, 1_000_001).expect("accepted");
 
-        let mut reloaded = SpaVerifier::load(vec![client], 300, &state_path)
-            .expect("verifier loads persisted state");
+        let mut reloaded =
+            SpaVerifier::load(vec![client], 300, &state_path, TEST_SERVER_PUBKEY, false)
+                .expect("verifier loads persisted state");
         assert!(matches!(
             reloaded.verify(&payload, 1_000_002),
             Err(SpaVerifyError::ReplayedCounter)
         ));
 
         let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn tier_check_is_gated_behind_valid_signature() {
+        // F-016: a decoy-tier client with a *valid* signature is rejected as
+        // UnauthorizedTier (tier is reachable only after the signature passes).
+        let decoy_key = generate_ed25519_keypair();
+        let mut decoy = client_from_key("decoy-client", &decoy_key);
+        decoy.tier = ClientTier::Decoy;
+        let mut verifier = SpaVerifier::new(vec![decoy], 300, TEST_SERVER_PUBKEY);
+        let payload =
+            SpaPacket::build(&decoy_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+
+        assert!(matches!(
+            verifier.verify(&payload, 1_000_001),
+            Err(SpaVerifyError::UnauthorizedTier(_))
+        ));
+
+        // A full-tier client whose packet carries a signature from a *different*
+        // key must fail signature verification before the tier branch.
+        let full_key = generate_ed25519_keypair();
+        let wrong_key = generate_ed25519_keypair();
+        let full = client_from_key("full-client", &full_key);
+        let mut verifier = SpaVerifier::new(vec![full], 300, TEST_SERVER_PUBKEY);
+        let mut forged =
+            SpaPacket::build(&wrong_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+        let legit =
+            SpaPacket::build(&full_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+        let key_id_len = full_key.verifying_key().to_bytes().len().min(8);
+        // key_id sits at offset 3 in the packet (version(2) + flags(1)).
+        let key_id_offset = 3;
+        forged[key_id_offset..key_id_offset + key_id_len]
+            .copy_from_slice(&legit[key_id_offset..key_id_offset + key_id_len]);
+
+        assert!(matches!(
+            verifier.verify(&forged, 1_000_001),
+            Err(SpaVerifyError::Parse(SpaError::BadSignature))
+        ));
     }
 
     #[test]
@@ -298,7 +400,8 @@ mod tests {
         let second = client_from_key("second", &second_key);
         let first_key_id = first.key_id;
 
-        let mut verifier = SpaVerifier::new(vec![first, second.clone()], 300);
+        let mut verifier =
+            SpaVerifier::new(vec![first, second.clone()], 300, TEST_SERVER_PUBKEY);
         let removed = verifier.reload_clients(vec![second]);
 
         assert_eq!(vec![first_key_id], removed);

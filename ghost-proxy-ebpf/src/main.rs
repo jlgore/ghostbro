@@ -30,6 +30,15 @@ macro_rules! copy_payload_bytes {
 
 const CONFIG_INDEX: u32 = 0;
 const RATE_REFILL_NS: u64 = 60_000_000_000;
+// Single-slot index for the global SPA admission bucket.
+const GLOBAL_RATE_INDEX: u32 = 0;
+// The global bucket admits this many times the per-IP limit per refill window.
+// This bounds the total candidates pushed to SPA_RING regardless of how many
+// distinct (spoofable) source IPs an attacker cycles through, while leaving
+// generous headroom for legitimate clients arriving from many IPs.
+const GLOBAL_RATE_MULTIPLIER: u32 = 256;
+// Absolute ceiling for the global budget (overflow / pathological-config guard).
+const GLOBAL_RATE_MAX: u32 = 1_000_000;
 
 #[map(name = "CONFIG")]
 static CONFIG: Array<BpfConfig> = Array::with_max_entries(1, 0);
@@ -39,6 +48,9 @@ static ALLOW_MAP: HashMap<u32, AllowEntry> = HashMap::with_max_entries(4096, 0);
 
 #[map(name = "RATE_LIMIT")]
 static RATE_LIMIT: HashMap<u32, RateState> = HashMap::with_max_entries(16384, 0);
+
+#[map(name = "GLOBAL_RATE")]
+static GLOBAL_RATE: Array<RateState> = Array::with_max_entries(1, 0);
 
 #[map(name = "SPA_RING")]
 static SPA_RING: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
@@ -141,6 +153,7 @@ fn handle_udp(
 
     if is_structural_spa(data, data_end, payload_offset, payload_len)?
         && rate_limit_allows(src_ip, rate_limit_per_minute)
+        && global_rate_limit_allows(rate_limit_per_minute)
     {
         emit_spa_event(
             data,
@@ -216,6 +229,48 @@ fn rate_limit_allows(src_ip: u32, configured_limit: u32) -> bool {
     true
 }
 
+/// Global SPA admission budget shared across all source IPs.
+///
+/// The per-IP bucket in `rate_limit_allows` is keyed on the attacker-controlled
+/// IPv4 source address, so spoofing a fresh IP per packet yields a fresh full
+/// bucket every time. This single global token bucket caps the aggregate number
+/// of candidates that reach `emit_spa_event` (and thus the userspace Ed25519
+/// verifier) per refill window, regardless of src_ip diversity.
+fn global_rate_limit_allows(configured_limit: u32) -> bool {
+    let per_ip_limit = if configured_limit == 0 {
+        DEFAULT_RATE_LIMIT_PER_MINUTE
+    } else {
+        configured_limit
+    };
+    let limit = per_ip_limit
+        .saturating_mul(GLOBAL_RATE_MULTIPLIER)
+        .min(GLOBAL_RATE_MAX);
+
+    let now = unsafe { bpf_ktime_get_ns() };
+
+    let Some(state_ptr) = GLOBAL_RATE.get_ptr_mut(GLOBAL_RATE_INDEX) else {
+        // Map slot unavailable: fail closed so spoofing cannot bypass the gate.
+        return false;
+    };
+    // Single-element Array: this pointer is to the in-map value, so updates
+    // through it persist without an explicit insert.
+    let state = unsafe { &mut *state_ptr };
+
+    // Array entries are zero-initialized by the kernel; treat last_ns == 0 as an
+    // uninitialized bucket and seed it to a full budget for the current window.
+    if state.last_ns == 0 || now.saturating_sub(state.last_ns) >= RATE_REFILL_NS {
+        state.tokens = limit;
+        state.last_ns = now;
+    }
+
+    if state.tokens == 0 {
+        return false;
+    }
+
+    state.tokens = state.tokens.saturating_sub(1);
+    true
+}
+
 fn emit_spa_event(
     data: usize,
     data_end: usize,
@@ -228,6 +283,15 @@ fn emit_spa_event(
         return Ok(());
     }
 
+    // Reflect the real payload length in the event, clamped to the buffer size.
+    // The range check above already bounds this to SPA_MIN_LEN..=SPA_MAX_LEN; the
+    // min() is defensive so the writer can never advertise more than fits.
+    let payload_len = if payload_len > SPA_MAX_LEN {
+        SPA_MAX_LEN
+    } else {
+        payload_len
+    };
+
     let Some(mut reservation) = SPA_RING.reserve::<SpaEvent>(0) else {
         return Ok(());
     };
@@ -235,10 +299,13 @@ fn emit_spa_event(
     let event = reservation.as_mut_ptr() as *mut u8;
     write_u32_ne(event, 0, src_ip);
     write_u16_ne(event, 4, src_port);
-    write_u16_ne(event, 6, SPA_MIN_LEN as u16);
+    write_u16_ne(event, 6, payload_len as u16);
 
+    // Enumerate the full SPA_MAX_LEN window: copy_payload_byte writes 0 for any
+    // INDEX >= payload_len, so this copies exactly payload_len bytes and zeroes
+    // the remainder of the fixed-size event buffer (no uninitialized tail).
     copy_payload_bytes!(
-        data, data_end, payload_offset, SPA_MIN_LEN, event;
+        data, data_end, payload_offset, payload_len, event;
         0, 1, 2, 3, 4, 5, 6, 7,
         8, 9, 10, 11, 12, 13, 14, 15,
         16, 17, 18, 19, 20, 21, 22, 23,
@@ -252,7 +319,9 @@ fn emit_spa_event(
         80, 81, 82, 83, 84, 85, 86, 87,
         88, 89, 90, 91, 92, 93, 94, 95,
         96, 97, 98, 99, 100, 101, 102, 103,
-        104, 105, 106,
+        104, 105, 106, 107, 108, 109, 110, 111,
+        112, 113, 114, 115, 116, 117, 118, 119,
+        120, 121, 122, 123, 124, 125, 126, 127,
     );
 
     reservation.submit(0);
@@ -318,9 +387,10 @@ fn copy_payload_byte<const INDEX: usize>(
             .checked_add(INDEX)
             .and_then(|offset| data.checked_add(offset))
         {
-            let end = ptr.wrapping_add(1);
-            if end <= data_end {
-                value = unsafe { *(ptr as *const u8) };
+            if let Some(end) = ptr.checked_add(1) {
+                if end <= data_end {
+                    value = unsafe { *(ptr as *const u8) };
+                }
             }
         }
     }

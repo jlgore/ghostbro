@@ -59,6 +59,17 @@ pub fn derive_noise_static_public_key(signing_key: &SigningKey) -> [u8; 32] {
     x25519_dalek::PublicKey::from(&private).to_bytes()
 }
 
+/// Derive the X25519 public key for a raw 32-byte Noise static private key.
+///
+/// The server holds its Noise static key as raw private bytes (not an Ed25519
+/// identity), so it cannot use [`derive_noise_static_public_key`]. This computes
+/// the matching public key so the server can bind its identity into SPA
+/// verification.
+pub fn derive_noise_public_from_private(private_key: &[u8; 32]) -> [u8; 32] {
+    let private = x25519_dalek::StaticSecret::from(*private_key);
+    x25519_dalek::PublicKey::from(&private).to_bytes()
+}
+
 pub fn encode_noise_public_key(public_key: &[u8; 32]) -> String {
     STANDARD.encode(public_key)
 }

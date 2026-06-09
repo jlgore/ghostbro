@@ -245,10 +245,14 @@ Send one UDP SPA packet:
 ```bash
 cargo run -p ghost-proxy-client -- send-udp-spa \
   --identity-key /tmp/ghost-debug.key \
+  --server-key /tmp/ghost-server-noise.pub \
   --endpoint 127.0.0.1:5353
 ```
 
-The server should log `SPA_ACCEPT` and `ALLOW_MAP_WRITE` for `127.0.0.1`.
+`--server-key` is required: the destination server's Noise public key is bound
+into the SPA signature (authenticated, not transmitted) so a packet only opens
+the server it was built for. The server should log `SPA_ACCEPT` and
+`ALLOW_MAP_WRITE` for `127.0.0.1`.
 
 For end-to-end local checks, use the existing xtask smoke helpers such as `cargo xtask smoke-noise-loopback`, `cargo xtask smoke-socks5-loopback`, `cargo xtask smoke-socks5-listener-loopback`, or `cargo xtask smoke-ghost-relay-loopback`. The Ghost Relay smoke submits a local web fetch, reconnects to list jobs, reconnects to download the stored result, then reconnects to delete it.
 

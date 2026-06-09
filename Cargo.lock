@@ -981,6 +981,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",

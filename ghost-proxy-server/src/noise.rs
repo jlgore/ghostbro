@@ -18,6 +18,7 @@ use ghost_proxy_common::{
     keys::key_id_hex,
     protocol::{PROTOCOL_GHOST_RELAY, PROTOCOL_SOCKS5},
 };
+use subtle::ConstantTimeEq;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use tokio::{
@@ -176,7 +177,12 @@ async fn handle_ghost_relay(
 fn verify_client_noise_static(remote_static: Option<&[u8]>, expected: &[u8; 32]) -> Result<()> {
     let remote_static =
         remote_static.context("Noise IK message 1 did not include an initiator static key")?;
-    if remote_static != expected.as_slice() {
+    // Constant-time comparison to avoid leaking how many leading bytes of the
+    // SPA-authorized identity key matched. The length guard ensures ct_eq
+    // operates over two equal-length 32-byte slices.
+    let matches = remote_static.len() == expected.len()
+        && bool::from(remote_static.ct_eq(expected.as_slice()));
+    if !matches {
         bail!("client Noise static key does not match SPA-authorized identity");
     }
     Ok(())
@@ -485,6 +491,15 @@ fn load_or_generate_static_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
             Ok(key)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if std::env::var_os("GHOST_PROXY_GENERATE_IDENTITY").is_none() {
+                bail!(
+                    "Noise static identity file {} not found; refusing to mint a new pinned \
+                     identity on the serving path. Provision the identity out of band, or set \
+                     GHOST_PROXY_GENERATE_IDENTITY=1 to opt into auto-generation (provisioning \
+                     and smoke tests only).",
+                    path.display()
+                );
+            }
             let params = NOISE_PATTERN.parse().context("invalid Noise pattern")?;
             let keypair = snow::Builder::new(params)
                 .generate_keypair()
@@ -505,6 +520,20 @@ fn load_or_generate_static_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
         }
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+/// Load this server's Noise static *public* key (32 bytes) from its identity
+/// file. Used to bind the server's identity into SPA verification so a SPA
+/// accepted by one node does not verify on another (F-003).
+pub fn load_static_public_key(path: impl AsRef<Path>) -> Result<[u8; 32]> {
+    let private = load_or_generate_static_key(path)?;
+    let private: [u8; 32] = private
+        .as_slice()
+        .try_into()
+        .context("Noise static private key must be 32 bytes")?;
+    Ok(ghost_proxy_common::keys::derive_noise_public_from_private(
+        &private,
+    ))
 }
 
 fn write_private_key_file(

@@ -15,7 +15,7 @@
 
 use std::{
     fs,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -110,6 +110,11 @@ struct RelayInner {
     config: RelayConfig,
     tx: mpsc::UnboundedSender<JobRef>,
     http: reqwest::Client,
+    /// Per-client serialization for quota accounting. Holding the per-key lock
+    /// across the usage read + write makes the check-then-write atomic so
+    /// concurrent jobs for the same client cannot both pass the quota check
+    /// before writing. Keyed on key_id_hex; different clients never contend.
+    client_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>,
 }
 
 /// Handle to the running relay engine. Cloning is cheap (shared `Arc`).
@@ -123,16 +128,14 @@ impl RelayEngine {
     /// one-shot recovery scan that re-enqueues jobs interrupted by a restart.
     pub fn start(config: RelayConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<JobRef>();
-        let http = reqwest::Client::builder()
-            .timeout(config.fetch_timeout)
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .user_agent("ghost-proxy-relay/0.2 (+https://github.com/ghost-proxy)")
+        let http = relay_client_defaults(reqwest::Client::builder(), config.fetch_timeout, config.allow_loopback)
             .build()
             .expect("failed to build relay HTTP client");
         let inner = Arc::new(RelayInner {
             config,
             tx,
             http,
+            client_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let rx = Arc::new(Mutex::new(rx));
@@ -242,6 +245,16 @@ impl RelayInner {
         self.enqueue(key_id, "package", spec.encode(), false)
     }
 
+    /// Return the per-client quota lock, creating it on first use. Keyed on
+    /// key_id_hex so only jobs for the same client serialize.
+    fn client_lock(&self, key_id_hex: &str) -> Arc<std::sync::Mutex<()>> {
+        let mut locks = self
+            .client_locks
+            .lock()
+            .expect("client lock registry poisoned");
+        locks.entry(key_id_hex.to_owned()).or_default().clone()
+    }
+
     /// Persist a queued job and hand it to the worker pool. Enforces per-client
     /// quotas before accepting.
     fn enqueue(
@@ -252,6 +265,10 @@ impl RelayInner {
         normalize: bool,
     ) -> Result<Vec<u8>> {
         let client_dir = self.client_dir(key_id);
+        // Serialize quota accounting for this client across the usage read and
+        // the metadata write below, so concurrent enqueues cannot both pass.
+        let quota_lock = self.client_lock(&key_id_hex(key_id));
+        let _quota_guard = quota_lock.lock().expect("client quota lock poisoned");
         let (job_count, byte_total) = self.client_usage(&client_dir)?;
         if job_count >= self.config.max_jobs_per_client {
             return Ok(relay_status_response(
@@ -470,6 +487,12 @@ impl RelayInner {
         }?;
 
         // Enforce the per-client storage quota against the produced artifact.
+        // Hold the per-client quota lock across the usage read and the object
+        // write so concurrent jobs for this client cannot both pass the check.
+        // The critical section is fully synchronous (no .await), so the std
+        // Mutex guard is never held across an await point.
+        let quota_lock = self.client_lock(&job.key_id_hex);
+        let quota_guard = quota_lock.lock().expect("client quota lock poisoned");
         let (_, existing_bytes) = self.client_usage(&client_dir)?;
         if existing_bytes.saturating_add(outcome.body.len() as u64) > self.config.max_bytes_per_client
         {
@@ -487,6 +510,9 @@ impl RelayInner {
         sha.update(&outcome.body);
         let sha256 = format!("{:x}", sha.finalize());
         fs::write(primary_object_path(&client_dir, &metadata.job_id), &outcome.body)?;
+        // Quota check + primary write are committed; release before any further
+        // (potentially awaiting) work so the lock is never held across an await.
+        drop(quota_guard);
 
         metadata.body_len = outcome.body.len() as u64;
         metadata.http_status = outcome.http_status;
@@ -550,6 +576,9 @@ impl RelayInner {
             .arg("clone")
             .arg("--mirror")
             .arg("--quiet")
+            // End-of-options separator: the client-controlled URL can never be
+            // parsed by git as an option (e.g. a leading `-`).
+            .arg("--")
             .arg(&metadata.source)
             .arg(&mirror)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -565,9 +594,25 @@ impl RelayInner {
             .arg("create")
             .arg(&bundle)
             .arg("--all")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "true")
             .kill_on_drop(true);
         run_command_with_timeout(bundle_cmd, self.config.git_timeout, "git bundle create").await?;
 
+        // Size-check the produced bundle before reading it into memory, mirroring
+        // the http_get_bytes max_object_len guard. Without this a large remote
+        // can produce a multi-GB bundle that fs::read would fully allocate before
+        // the post-job guard runs.
+        let bundle_len = fs::metadata(&bundle)
+            .context("failed to stat produced git bundle")?
+            .len();
+        if bundle_len > self.config.max_object_len as u64 {
+            let _ = fs::remove_dir_all(&work);
+            bail!(
+                "git bundle {bundle_len} bytes exceeds max object size {}",
+                self.config.max_object_len
+            );
+        }
         let body = fs::read(&bundle).context("failed to read produced git bundle")?;
         let _ = fs::remove_dir_all(&work);
         Ok(JobOutcome {
@@ -583,8 +628,9 @@ impl RelayInner {
         metadata: &RelayJobMetadata,
     ) -> Result<JobOutcome> {
         let spec = PackageSpec::decode(&metadata.source)?;
-        let resolved = spec.resolve(&self.http).await?;
-        validate_public_url(&resolved.url, self.config.allow_loopback)?;
+        let resolved = spec
+            .resolve(self.config.allow_loopback, self.config.fetch_timeout)
+            .await?;
         let (status, content_type, body) = self
             .http_get_bytes(&resolved.url, self.config.max_object_len)
             .await?;
@@ -604,8 +650,11 @@ impl RelayInner {
         url: &str,
         max_len: usize,
     ) -> Result<(u16, Option<String>, Vec<u8>)> {
-        let response = self
-            .http
+        // Validate + pin in one step so reqwest cannot independently re-resolve
+        // the host to a different (internal) address (DNS-rebinding TOCTOU).
+        let (client, _parsed) =
+            validate_and_pin(url, self.config.allow_loopback, self.config.fetch_timeout)?;
+        let response = client
             .get(url)
             .send()
             .await
@@ -769,7 +818,12 @@ enum ExpectedDigest {
 impl ExpectedDigest {
     fn verify(&self, body: &[u8]) -> Result<()> {
         match self {
-            ExpectedDigest::None => Ok(()),
+            // A missing/unsupported digest is a hard failure on the package
+            // download path: with registry-controlled URLs plus redirect or DNS
+            // rebinding, accepting unverified bytes is an integrity bypass.
+            ExpectedDigest::None => {
+                bail!("package download rejected: registry provided no usable digest")
+            }
             ExpectedDigest::Sha256(expected) => {
                 let mut hasher = Sha256::new();
                 hasher.update(body);
@@ -841,20 +895,20 @@ impl PackageSpec {
         Self::parse(eco, name, version)
     }
 
-    async fn resolve(&self, http: &reqwest::Client) -> Result<ResolvedPackage> {
+    async fn resolve(&self, allow_loopback: bool, timeout: Duration) -> Result<ResolvedPackage> {
         match self.ecosystem {
-            Ecosystem::Pypi => self.resolve_pypi(http).await,
-            Ecosystem::Npm => self.resolve_npm(http).await,
-            Ecosystem::Crates => self.resolve_crates(http).await,
+            Ecosystem::Pypi => self.resolve_pypi(allow_loopback, timeout).await,
+            Ecosystem::Npm => self.resolve_npm(allow_loopback, timeout).await,
+            Ecosystem::Crates => self.resolve_crates(allow_loopback, timeout).await,
         }
     }
 
-    async fn resolve_pypi(&self, http: &reqwest::Client) -> Result<ResolvedPackage> {
+    async fn resolve_pypi(&self, allow_loopback: bool, timeout: Duration) -> Result<ResolvedPackage> {
         let url = match &self.version {
             Some(version) => format!("https://pypi.org/pypi/{}/{}/json", self.name, version),
             None => format!("https://pypi.org/pypi/{}/json", self.name),
         };
-        let json = get_json(http, &url).await?;
+        let json = get_json(&url, allow_loopback, timeout).await?;
         let urls = json
             .get("urls")
             .and_then(|value| value.as_array())
@@ -882,9 +936,9 @@ impl PackageSpec {
         })
     }
 
-    async fn resolve_npm(&self, http: &reqwest::Client) -> Result<ResolvedPackage> {
+    async fn resolve_npm(&self, allow_loopback: bool, timeout: Duration) -> Result<ResolvedPackage> {
         let url = format!("https://registry.npmjs.org/{}", self.name);
-        let json = get_json(http, &url).await?;
+        let json = get_json(&url, allow_loopback, timeout).await?;
         let version = match &self.version {
             Some(version) => version.clone(),
             None => json
@@ -917,13 +971,13 @@ impl PackageSpec {
         })
     }
 
-    async fn resolve_crates(&self, http: &reqwest::Client) -> Result<ResolvedPackage> {
+    async fn resolve_crates(&self, allow_loopback: bool, timeout: Duration) -> Result<ResolvedPackage> {
         let version = self
             .version
             .as_ref()
             .context("crates packages require a version")?;
         let meta_url = format!("https://crates.io/api/v1/crates/{}/{version}", self.name);
-        let json = get_json(http, &meta_url).await?;
+        let json = get_json(&meta_url, allow_loopback, timeout).await?;
         let version_obj = json
             .get("version")
             .context("crates response missing version object")?;
@@ -937,14 +991,56 @@ impl PackageSpec {
             .map(|value| ExpectedDigest::Sha256(value.to_owned()))
             .unwrap_or(ExpectedDigest::None);
         Ok(ResolvedPackage {
-            url: format!("https://crates.io{dl_path}"),
+            url: crates_download_url(dl_path)?,
             digest: checksum,
         })
     }
 }
 
-async fn get_json(http: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
-    let response = http
+/// Join a registry-supplied `dl_path` against the fixed crates.io base and
+/// assert the resolved host is an expected crates registry/CDN host. Prevents
+/// host-confusion (e.g. `dl_path` `@evil.com/x` -> `https://crates.io@evil.com/x`,
+/// where `evil.com` becomes the host via the userinfo delimiter) and
+/// scheme-relative/absolute redirects embedded in `dl_path`.
+fn crates_download_url(dl_path: &str) -> Result<String> {
+    const EXPECTED_HOSTS: [&str; 2] = ["crates.io", "static.crates.io"];
+    let joined = reqwest::Url::parse("https://crates.io/")
+        .context("invalid crates base URL")?
+        .join(dl_path)
+        .with_context(|| format!("invalid crates dl_path {dl_path}"))?;
+    let host = joined
+        .host_str()
+        .context("crates download URL missing host")?;
+    if !EXPECTED_HOSTS.contains(&host) {
+        bail!("crates dl_path resolved to unexpected host {host}");
+    }
+    Ok(joined.into())
+}
+
+/// Registry hosts `get_json` is permitted to query. Defense-in-depth on the
+/// entry host; the per-hop redirect guard + IP pinning below cover redirects.
+const REGISTRY_HOSTS: &[&str] = &["pypi.org", "registry.npmjs.org", "crates.io"];
+
+/// Reject any registry query URL whose host is not a known package registry.
+fn assert_registry_host(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).context("invalid registry URL")?;
+    let host = parsed.host_str().context("registry URL missing host")?;
+    if REGISTRY_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        Ok(())
+    } else {
+        bail!("registry host {host} is not an allowed package registry");
+    }
+}
+
+async fn get_json(url: &str, allow_loopback: bool, timeout: Duration) -> Result<serde_json::Value> {
+    assert_registry_host(url)?;
+    // Registry hosts are subject to the same rebinding window, so validate the
+    // resolved IPs and pin them into a request-scoped client before fetching.
+    let (client, _parsed) = validate_and_pin(url, allow_loopback, timeout)?;
+    let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
@@ -963,7 +1059,15 @@ fn parse_sri_sha512(integrity: &str) -> Option<Vec<u8>> {
     let encoded = integrity.split_whitespace().find_map(|token| {
         token.strip_prefix("sha512-")
     })?;
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).ok()
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).ok()?;
+    // A SHA-512 digest is exactly 64 bytes. Reject malformed payloads rather
+    // than coercing them into an ExpectedDigest::Sha512 of the wrong length.
+    if decoded.len() == 64 {
+        Some(decoded)
+    } else {
+        None
+    }
 }
 
 // ---- validation ----------------------------------------------------------
@@ -974,7 +1078,7 @@ fn validate_public_url(url: &str, allow_loopback: bool) -> Result<()> {
         "http" | "https" => {}
         scheme => bail!("unsupported relay URL scheme {scheme}"),
     }
-    resolve_guard(&parsed, allow_loopback)
+    resolve_guard(&parsed, allow_loopback).map(|_| ())
 }
 
 fn validate_git_url(url: &str, allow_loopback: bool) -> Result<()> {
@@ -983,21 +1087,24 @@ fn validate_git_url(url: &str, allow_loopback: bool) -> Result<()> {
         "http" | "https" | "git" => {}
         scheme => bail!("unsupported git URL scheme {scheme}"),
     }
-    resolve_guard(&parsed, allow_loopback)
+    resolve_guard(&parsed, allow_loopback).map(|_| ())
 }
 
 /// Resolve the URL host and reject loopback, private, multicast, and
 /// unspecified destinations to prevent the relay from being used to reach
 /// internal services (SSRF guard).
-fn resolve_guard(parsed: &reqwest::Url, allow_loopback: bool) -> Result<()> {
+///
+/// Returns the validated socket addresses so the caller can pin them into the
+/// HTTP client, closing the DNS-rebinding TOCTOU window between this guard and
+/// reqwest's own (otherwise independent) resolution.
+fn resolve_guard(parsed: &reqwest::Url, allow_loopback: bool) -> Result<Vec<SocketAddr>> {
     use std::net::ToSocketAddrs;
     let host = parsed.host_str().context("relay URL missing host")?;
     let port = parsed
         .port_or_known_default()
         .context("relay URL missing port")?;
-    let mut resolved = false;
+    let mut validated = Vec::new();
     for addr in (host, port).to_socket_addrs()? {
-        resolved = true;
         let ip = addr.ip();
         if ip.is_unspecified()
             || ip.is_multicast()
@@ -1006,11 +1113,60 @@ fn resolve_guard(parsed: &reqwest::Url, allow_loopback: bool) -> Result<()> {
         {
             bail!("relay URL resolves to disallowed address {ip}");
         }
+        validated.push(addr);
     }
-    if !resolved {
+    if validated.is_empty() {
         bail!("relay URL host did not resolve");
     }
-    Ok(())
+    Ok(validated)
+}
+
+/// Apply the relay's shared HTTP client defaults (timeout, user-agent) plus a
+/// custom redirect policy that re-runs `resolve_guard` on every hop. Without the
+/// per-hop check, a redirect `Location` could point into loopback/private/
+/// metadata hosts (e.g. 169.254.169.254) and bypass the initial-URL guard.
+fn relay_client_defaults(
+    builder: reqwest::ClientBuilder,
+    timeout: Duration,
+    allow_loopback: bool,
+) -> reqwest::ClientBuilder {
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error(anyhow::anyhow!("too many redirects"));
+        }
+        match resolve_guard(attempt.url(), allow_loopback) {
+            Ok(_) => attempt.follow(),
+            Err(err) => attempt.error(err),
+        }
+    });
+    builder
+        .timeout(timeout)
+        .redirect(redirect_policy)
+        .user_agent("ghost-proxy-relay/0.2 (+https://github.com/ghost-proxy)")
+}
+
+/// Validate `url` through `resolve_guard` and build a request-scoped client that
+/// is pinned (via `resolve_to_addrs`) to exactly the IPs that were validated.
+/// reqwest then connects to those addresses instead of performing a second,
+/// independent DNS lookup, so a low-TTL rebind cannot swap in an internal IP
+/// after the guard has passed.
+fn validate_and_pin(
+    url: &str,
+    allow_loopback: bool,
+    timeout: Duration,
+) -> Result<(reqwest::Client, reqwest::Url)> {
+    let parsed = reqwest::Url::parse(url).context("invalid relay URL")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => bail!("unsupported relay URL scheme {scheme}"),
+    }
+    let addrs = resolve_guard(&parsed, allow_loopback)?;
+    let host = parsed.host_str().context("relay URL missing host")?;
+    let client = relay_client_defaults(reqwest::Client::builder(), timeout, allow_loopback)
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .context("failed to build pinned relay HTTP client")?;
+    Ok((client, parsed))
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {
@@ -1282,6 +1438,49 @@ mod tests {
     }
 
     #[test]
+    fn missing_digest_is_rejected() {
+        // F-009: no usable digest from the registry must not silently pass.
+        assert!(ExpectedDigest::None.verify(b"any bytes at all").is_err());
+    }
+
+    #[test]
+    fn resolve_guard_returns_validated_addr_and_rejects_private() {
+        // F-004: a literal-IP URL exercises resolve_guard deterministically.
+        let public = reqwest::Url::parse("http://93.184.216.34/x").unwrap();
+        let addrs = resolve_guard(&public, false).expect("public ip allowed");
+        assert!(addrs.iter().any(|a| a.ip().to_string() == "93.184.216.34"));
+
+        let private = reqwest::Url::parse("http://10.0.0.5/x").unwrap();
+        assert!(resolve_guard(&private, false).is_err());
+        let metadata = reqwest::Url::parse("http://169.254.169.254/latest/meta-data").unwrap();
+        assert!(resolve_guard(&metadata, false).is_err());
+    }
+
+    #[test]
+    fn crates_dl_path_cannot_redirect_host() {
+        // F-012: registry-controlled dl_path must not move the host off crates.io.
+        let ok = crates_download_url("/api/v1/crates/serde/1.0.0/download").expect("valid path");
+        assert_eq!("https://crates.io/api/v1/crates/serde/1.0.0/download", ok);
+        // Userinfo host-confusion joins as a crates.io path, not an evil.com host.
+        let confused = crates_download_url("@evil.com/x").expect("joins as path");
+        assert!(confused.starts_with("https://crates.io/"), "got {confused}");
+        // Scheme-relative and absolute redirects are rejected outright.
+        assert!(crates_download_url("//evil.com/x").is_err());
+        assert!(crates_download_url("https://evil.com/x").is_err());
+    }
+
+    #[test]
+    fn registry_host_allowlist_rejects_unexpected_hosts() {
+        // F-017.
+        assert!(assert_registry_host("https://pypi.org/pypi/requests/json").is_ok());
+        assert!(assert_registry_host("https://registry.npmjs.org/left-pad").is_ok());
+        assert!(assert_registry_host("https://crates.io/api/v1/crates/serde/1.0.0").is_ok());
+        assert!(assert_registry_host("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(assert_registry_host("https://pypi.org.evil.example/pypi/x/json").is_err());
+        assert!(assert_registry_host("not a url").is_err());
+    }
+
+    #[test]
     fn parses_npm_sha512_integrity() {
         let raw = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -1291,6 +1490,13 @@ mod tests {
         let parsed = parse_sri_sha512(&integrity).expect("sha512 parsed");
         assert_eq!(64, parsed.len());
         assert!(parse_sri_sha512("sha1-deadbeef").is_none());
+        // F-015: a well-formed prefix whose decoded payload is not 64 bytes
+        // must be rejected rather than coerced into a wrong-length digest.
+        let short = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0xab_u8; 32],
+        );
+        assert!(parse_sri_sha512(&format!("sha512-{short}")).is_none());
     }
 
     #[test]

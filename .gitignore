@@ -4,3 +4,9 @@
 # Local agent / tooling state
 .claude/
 .patch-state/
+
+# Generated patch artifacts (/patch skill output; the diffs are reproducible
+# from the branch itself, so they are not version-controlled)
+/PATCHES/
+/PATCHES.md
+/PATCHES.json

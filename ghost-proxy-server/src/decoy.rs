@@ -67,7 +67,16 @@ pub fn router(
             response_status,
             trust_forwarded_for,
             trusted_proxy_cidrs,
-            webroot: webroot.map(PathBuf::from),
+            // Canonicalize the webroot once at construction so per-request
+            // containment checks compare against a symlink-resolved, absolute
+            // base. A missing/unreadable webroot is a hard config error.
+            webroot: match webroot {
+                Some(root) => Some(
+                    fs::canonicalize(root)
+                        .with_context(|| format!("failed to canonicalize decoy webroot {root}"))?,
+                ),
+                None => None,
+            },
         }))
 }
 
@@ -103,13 +112,27 @@ fn http_date() -> HeaderValue {
 
 async fn static_response(webroot: &Path, uri_path: &str) -> Option<Response> {
     let path = static_path(webroot, uri_path)?;
-    let bytes = fs::read(&path).ok()?;
+    // `static_path` blocks `..` but does not resolve symlinks, so a symlink
+    // under the webroot (e.g. webroot/data -> /etc) could otherwise escape.
+    // Canonicalize the candidate and require it to stay within the (already
+    // canonical) webroot before reading. canonicalize() resolves every symlink
+    // in the path, so containment holds for the real target.
+    let resolved = fs::canonicalize(&path).ok()?;
+    if !resolved.starts_with(webroot) {
+        tracing::warn!(
+            requested = %uri_path,
+            resolved = %resolved.display(),
+            "rejecting static request that resolves outside webroot"
+        );
+        return None;
+    }
+    let bytes = fs::read(&resolved).ok()?;
     let mut headers = HeaderMap::new();
     headers.insert(header::SERVER, HeaderValue::from_static("nginx/1.26.0"));
     headers.insert(header::DATE, http_date());
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type(&path)),
+        HeaderValue::from_static(content_type(&resolved)),
     );
 
     Some((headers, bytes).into_response())
@@ -340,6 +363,38 @@ mod tests {
     #[test]
     fn tls_config_errors_on_missing_files() {
         assert!(build_server_config("/nonexistent/cert.pem", "/nonexistent/key.pem").is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_static_symlink_escape() {
+        // F-006: a symlink under the webroot that points outside it must not be
+        // served, even though `static_path` accepts the (dot-dot-free) request.
+        let base = std::env::temp_dir().join(format!("ghost-decoy-{}", request_id()));
+        let webroot = base.join("webroot");
+        let secret_dir = base.join("secret");
+        fs::create_dir_all(&webroot).expect("create webroot");
+        fs::create_dir_all(&secret_dir).expect("create secret dir");
+        fs::write(secret_dir.join("passwd"), b"root:x:0:0").expect("write secret");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret_dir, webroot.join("escape")).expect("symlink");
+        #[cfg(not(unix))]
+        {
+            let _ = (&secret_dir, &webroot);
+            return;
+        }
+
+        let canonical_webroot = fs::canonicalize(&webroot).expect("canonicalize webroot");
+
+        // static_path itself accepts the path (only `..` components are blocked).
+        assert!(static_path(&canonical_webroot, "/escape/passwd").is_some());
+
+        // static_response must reject it because it resolves outside the webroot.
+        assert!(static_response(&canonical_webroot, "/escape/passwd")
+            .await
+            .is_none());
+
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

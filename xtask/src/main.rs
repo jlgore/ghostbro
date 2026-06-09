@@ -537,8 +537,9 @@ fn print_loopback_instructions(
     println!();
     println!("3. Send one SPA packet from another terminal:");
     println!(
-        "   cargo run -p ghost-proxy-client -- send-udp-spa --identity-key {} --endpoint 127.0.0.1:{}",
+        "   cargo run -p ghost-proxy-client -- send-udp-spa --identity-key {} --server-key {} --endpoint 127.0.0.1:{}",
         fixture.key_path.display(),
+        public_key_path(&fixture.server_noise_key).display(),
         spa_port
     );
     println!();
@@ -720,6 +721,10 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
             "RUST_LOG=debug",
             "GHOST_PROXY_DISABLE_AUTH_WATCH=1",
             "GHOST_PROXY_RELAY_ALLOW_LOOPBACK=1",
+            // The fixture deletes the server Noise key and relies on the server
+            // minting one at startup; opt into auto-generation explicitly since
+            // the serving path now fails closed on a missing identity (F-001).
+            "GHOST_PROXY_GENERATE_IDENTITY=1",
         ]);
         command.arg(format!(
             "GHOST_PROXY_RELAY_SPOOL_DIR={}-relay-spool",
@@ -734,6 +739,9 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
         command
     };
     command.env("GHOST_PROXY_RELAY_ALLOW_LOOPBACK", "1");
+    // Smoke fixture deletes the server Noise key; opt into regeneration so the
+    // fail-closed serving path (F-001) does not abort the loopback smoke run.
+    command.env("GHOST_PROXY_GENERATE_IDENTITY", "1");
     command.env(
         "GHOST_PROXY_RELAY_SPOOL_DIR",
         format!("{}-relay-spool", config.identity_prefix.display()),

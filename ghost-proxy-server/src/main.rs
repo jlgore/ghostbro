@@ -76,10 +76,19 @@ async fn main() -> Result<()> {
 
         let authorized_keys = AuthorizedKeysFile::load(&config.clients.authorized_keys)?;
         let clients = authorized_keys.into_clients()?;
+        // Bind this node's Noise static identity into SPA verification so a SPA
+        // accepted here cannot be replayed against another node (F-003).
+        let server_static_pubkey = noise::load_static_public_key(&config.server.identity)?;
+        // Fail closed on a missing counter-state file unless explicitly
+        // initialising a fresh deployment (F-007).
+        let allow_missing_counter_state =
+            std::env::var_os("GHOST_PROXY_SPA_COUNTER_INIT").is_some();
         let verifier = spa::SpaVerifier::load(
             clients,
             config.spa.time_window_seconds(),
             config.spa.counter_state_path(),
+            server_static_pubkey,
+            allow_missing_counter_state,
         )?;
         let allowed_sources = Arc::new(RwLock::new(HashMap::new()));
         let bpf_config = ghost_proxy_bpf_common::BpfConfig {
