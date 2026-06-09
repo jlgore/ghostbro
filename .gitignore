@@ -1,0 +1,6 @@
+# Rust build output
+/target
+
+# Local agent / tooling state
+.claude/
+.patch-state/
