@@ -14,7 +14,7 @@ use fast_socks5::{
     server::{run_tcp_proxy, DnsResolveHelper, Socks5ServerProtocol},
     ReplyError, Socks5Command,
 };
-use ghost_proxy_common::{
+use ghostbro_common::{
     keys::key_id_hex,
     protocol::{PROTOCOL_GHOST_RELAY, PROTOCOL_SOCKS5},
 };
@@ -531,7 +531,7 @@ pub fn load_static_public_key(path: impl AsRef<Path>) -> Result<[u8; 32]> {
         .as_slice()
         .try_into()
         .context("Noise static private key must be 32 bytes")?;
-    Ok(ghost_proxy_common::keys::derive_noise_public_from_private(
+    Ok(ghostbro_common::keys::derive_noise_public_from_private(
         &private,
     ))
 }

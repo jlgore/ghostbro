@@ -19,7 +19,7 @@ use chacha20poly1305::{
 };
 use clap::{Parser, Subcommand};
 use fast_socks5::{server::Socks5ServerProtocol, ReplyError, Socks5Command};
-use ghost_proxy_common::{
+use ghostbro_common::{
     keys::{
         decode_signing_key, derive_noise_static_private_key, derive_noise_static_public_key,
         encode_noise_public_key, encode_public_key, encode_signing_key, generate_ed25519_keypair,
@@ -50,8 +50,8 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
 #[derive(Debug, Parser)]
-#[command(name = "ghost-proxy")]
-#[command(about = "Ghost Proxy client CLI")]
+#[command(name = "ghostbro")]
+#[command(about = "Ghostbro client CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -1832,7 +1832,7 @@ fn negotiate_local_socks5_tunnel(
     TcpStream,
     snow::TransportState,
     String,
-    ghost_proxy_common::keys::KeyId,
+    ghostbro_common::keys::KeyId,
     SocketAddr,
 )> {
     local_stream
@@ -2017,7 +2017,7 @@ fn connect_noise(
     TcpStream,
     snow::TransportState,
     Vec<u8>,
-    ghost_proxy_common::keys::KeyId,
+    ghostbro_common::keys::KeyId,
 )> {
     let server_static_pubkey: [u8; 32] = server_public_key
         .try_into()
@@ -2081,7 +2081,7 @@ fn connect_noise_with_failover(
     TcpStream,
     snow::TransportState,
     Vec<u8>,
-    ghost_proxy_common::keys::KeyId,
+    ghostbro_common::keys::KeyId,
     usize,
     SocketAddr,
 )> {
@@ -2625,7 +2625,7 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "ghost-proxy-{name}-{}",
+            "ghostbro-{name}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")

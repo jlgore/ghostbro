@@ -13,8 +13,8 @@ use aya::{
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
-use ghost_proxy_bpf_common::{AllowEntry, BpfConfig, SpaEvent, SPA_MAX_LEN};
-use ghost_proxy_common::keys::{key_id_hex, KeyId};
+use ghostbro_bpf_common::{AllowEntry, BpfConfig, SpaEvent, SPA_MAX_LEN};
+use ghostbro_common::keys::{key_id_hex, KeyId};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::keys::AuthorizedKeysFile;
@@ -67,10 +67,10 @@ impl EbpfRuntime {
             .context("failed to write eBPF CONFIG map")?;
 
         let program: &mut Xdp = ebpf
-            .program_mut("ghost_proxy_xdp")
-            .context("ghost_proxy_xdp program not found in eBPF object")?
+            .program_mut("ghostbro_xdp")
+            .context("ghostbro_xdp program not found in eBPF object")?
             .try_into()
-            .context("ghost_proxy_xdp has unexpected program type")?;
+            .context("ghostbro_xdp has unexpected program type")?;
         program.load().context("failed to load XDP program")?;
         program
             .attach(iface, XdpFlags::default())
@@ -148,7 +148,7 @@ impl EbpfRuntime {
                     Ok(accept) => {
                         self.allow_source(event.src_ip, &accept, allow_ttl_seconds)?;
                         tracing::info!(
-                            key_id = %ghost_proxy_common::keys::key_id_hex(&accept.key_id),
+                            key_id = %ghostbro_common::keys::key_id_hex(&accept.key_id),
                             client = %accept.client_name,
                             client_id = accept.client_id,
                             src_ip = %format_ipv4(event.src_ip),
@@ -175,7 +175,7 @@ impl EbpfRuntime {
                     Ok(accept) => {
                         self.allow_source(candidate.src_ip, &accept, allow_ttl_seconds)?;
                         tracing::info!(
-                            key_id = %ghost_proxy_common::keys::key_id_hex(&accept.key_id),
+                            key_id = %ghostbro_common::keys::key_id_hex(&accept.key_id),
                             client = %accept.client_name,
                             client_id = accept.client_id,
                             src_ip = %format_ipv4(candidate.src_ip),

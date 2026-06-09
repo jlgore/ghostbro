@@ -22,7 +22,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use ghost_proxy_common::{
+use ghostbro_common::{
     keys::key_id_hex,
     protocol::{
         GHOST_RELAY_ARTIFACT_NORMALIZED, GHOST_RELAY_ARTIFACT_PRIMARY, GHOST_RELAY_OP_DELETE,
@@ -1142,7 +1142,7 @@ fn relay_client_defaults(
     builder
         .timeout(timeout)
         .redirect(redirect_policy)
-        .user_agent("ghost-proxy-relay/0.2 (+https://github.com/ghost-proxy)")
+        .user_agent("ghostbro-relay/0.2 (+https://github.com/jlgore/ghostbro)")
 }
 
 /// Validate `url` through `resolve_guard` and build a request-scoped client that

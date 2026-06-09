@@ -1,11 +1,11 @@
 [package]
-name = "ghost-proxy-server"
+name = "ghostbro-server"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "ghost-proxy-server"
+name = "ghostbro-server"
 path = "src/main.rs"
 
 [dependencies]
@@ -17,8 +17,8 @@ base64.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 fast-socks5.workspace = true
-ghost-proxy-bpf-common = { path = "../ghost-proxy-bpf-common", features = ["user"] }
-ghost-proxy-common = { path = "../ghost-proxy-common" }
+ghostbro-bpf-common = { path = "../ghostbro-bpf-common", features = ["user"] }
+ghostbro-common = { path = "../ghostbro-common" }
 httpdate.workspace = true
 ipnet.workspace = true
 libc.workspace = true

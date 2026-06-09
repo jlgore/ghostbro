@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{fs, path::Path};
 
-use ghost_proxy_common::{
+use ghostbro_common::{
     keys::{decode_noise_public_key, decode_public_key, key_id_for_public_key, KeyError, KeyId},
     protocol::KEY_ID_LEN,
 };
@@ -80,7 +80,7 @@ fn index_to_client_id(index: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use ghost_proxy_common::keys::{
+    use ghostbro_common::keys::{
         derive_noise_static_public_key, encode_noise_public_key, encode_public_key,
         generate_ed25519_keypair,
     };

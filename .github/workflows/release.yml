@@ -23,7 +23,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build server + client
-        run: cargo build --release -p ghost-proxy-server -p ghost-proxy-client
+        run: cargo build --release -p ghostbro-server -p ghostbro-client
 
       # --- eBPF object (nightly + bpf-linker) ---
       - name: Install nightly toolchain
@@ -41,11 +41,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
-          PKG="ghost-proxy-${VERSION}-x86_64-linux"
+          PKG="ghostbro-${VERSION}-x86_64-linux"
           mkdir -p "dist/${PKG}"
-          cp target/release/ghost-proxy-server "dist/${PKG}/"
-          cp target/release/ghost-proxy        "dist/${PKG}/ghost-proxy-client"
-          cp target/bpfel-unknown-none/release/ghost-proxy-ebpf "dist/${PKG}/"
+          cp target/release/ghostbro-server "dist/${PKG}/"
+          cp target/release/ghostbro "dist/${PKG}/ghostbro-client"
+          cp target/bpfel-unknown-none/release/ghostbro-ebpf "dist/${PKG}/"
           cp deploy/ghost-proxy.service "dist/${PKG}/"
           cp README.md PRD.md "dist/${PKG}/"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"

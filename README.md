@@ -1,11 +1,11 @@
-# Ghost Proxy
+# Ghostbro
 
-Rust workspace for the Ghost Proxy PRD in `PRD.md`.
+Rust workspace for the Ghostbro PRD in `PRD.md`.
 
-- `ghost-proxy-common`: shared protocol, SPA packet, key, and crypto utilities
-- `ghost-proxy-client`: client CLI, key enrollment, SPA refresh, Noise tunnel, and local SOCKS5 listener
-- `ghost-proxy-server`: server daemon, SPA verification, built-in HTTPS decoy, XDP control, and Noise proxy listener
-- `ghost-proxy-ebpf`: XDP/eBPF packet gate
+- `ghostbro-common`: shared protocol, SPA packet, key, and crypto utilities
+- `ghostbro-client`: client CLI, key enrollment, SPA refresh, Noise tunnel, and local SOCKS5 listener
+- `ghostbro-server`: server daemon, SPA verification, built-in HTTPS decoy, XDP control, and Noise proxy listener
+- `ghostbro-ebpf`: XDP/eBPF packet gate
 
 ## Build
 
@@ -21,7 +21,7 @@ cargo xtask build-ebpf
 Normal client key generation writes an encrypted Ed25519 identity key. The passphrase is used with argon2id and ChaCha20-Poly1305.
 
 ```bash
-cargo run -p ghost-proxy-client -- keygen --output ./client/alice
+cargo run -p ghostbro-client -- keygen --output ./client/alice
 ```
 
 This writes:
@@ -45,7 +45,7 @@ tier = "full"
 ### 2. Generate the Server Noise Identity
 
 ```bash
-cargo run -p ghost-proxy-client -- server-keygen --output ./server/server
+cargo run -p ghostbro-client -- server-keygen --output ./server/server
 ```
 
 This writes:
@@ -112,10 +112,10 @@ If `RUST_LOG` is set, it overrides `[logging].level` and logs to the default sub
 Start the server with XDP attached:
 
 ```bash
-sudo RUST_LOG=info target/debug/ghost-proxy-server \
+sudo RUST_LOG=info target/debug/ghostbro-server \
   --config /etc/ghost-proxy/ghost-proxy.toml \
   --iface eth0 \
-  --ebpf-object target/bpfel-unknown-none/release/ghost-proxy-ebpf \
+  --ebpf-object target/bpfel-unknown-none/release/ghostbro-ebpf \
   --decoy-bind 0.0.0.0:443
 ```
 
@@ -153,7 +153,7 @@ working on kernels with `unprivileged_bpf_disabled=1`).
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin ghost-proxy
-sudo install -Dm755 target/release/ghost-proxy-server /usr/local/bin/ghost-proxy-server
+sudo install -Dm755 target/release/ghostbro-server /usr/local/bin/ghostbro-server
 sudo install -Dm644 deploy/ghost-proxy.service /etc/systemd/system/ghost-proxy.service
 sudo systemctl daemon-reload && sudo systemctl enable --now ghost-proxy
 ```
@@ -164,7 +164,7 @@ Enroll one server from its public key:
 
 ```bash
 SERVER_PUB=$(tr -d '\n' < ./server/server.pub)
-cargo run -p ghost-proxy-client -- enroll \
+cargo run -p ghostbro-client -- enroll \
   --server-key "$SERVER_PUB" \
   --endpoint 203.0.113.10:8443 \
   --spa-mode udp \
@@ -210,7 +210,7 @@ If a full pass over all candidates fails, the client waits `retry_interval_ms` a
 Start the local SOCKS5 listener and let the client send SPA, establish Noise IK, and fail over across configured servers if needed.
 
 ```bash
-cargo run -p ghost-proxy-client -- connect \
+cargo run -p ghostbro-client -- connect \
   --config ./client/servers.toml \
   --identity-key ./client/alice.key \
   --listen 127.0.0.1:1080
@@ -233,17 +233,17 @@ The helper writes `/tmp/ghost-debug.*`, including `/tmp/ghost-debug.noise`, `/tm
 Run the server with XDP attached to loopback:
 
 ```bash
-sudo RUST_LOG=debug target/debug/ghost-proxy-server \
+sudo RUST_LOG=debug target/debug/ghostbro-server \
   --config /tmp/ghost-server.toml \
   --iface lo \
-  --ebpf-object target/bpfel-unknown-none/release/ghost-proxy-ebpf \
+  --ebpf-object target/bpfel-unknown-none/release/ghostbro-ebpf \
   --decoy-bind 127.0.0.1:8080
 ```
 
 Send one UDP SPA packet:
 
 ```bash
-cargo run -p ghost-proxy-client -- send-udp-spa \
+cargo run -p ghostbro-client -- send-udp-spa \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --endpoint 127.0.0.1:5353
@@ -259,7 +259,7 @@ For end-to-end local checks, use the existing xtask smoke helpers such as `cargo
 Ghost Relay debug helpers support the durable web-fetch flow:
 
 ```bash
-cargo run -p ghost-proxy-client -- relay-submit-url \
+cargo run -p ghostbro-client -- relay-submit-url \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --spa-endpoint 127.0.0.1:5353 \
@@ -268,7 +268,7 @@ cargo run -p ghost-proxy-client -- relay-submit-url \
   --normalize                     # also store an HTML-to-markdown copy
 
 # Mirror a git repository (stored server-side as a git bundle):
-cargo run -p ghost-proxy-client -- relay-submit-git \
+cargo run -p ghostbro-client -- relay-submit-git \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --spa-endpoint 127.0.0.1:5353 \
@@ -276,20 +276,20 @@ cargo run -p ghost-proxy-client -- relay-submit-git \
   --git-url https://github.com/rust-lang/log.git
 
 # Retrieve a package from pypi / npm / crates (version optional for pypi/npm):
-cargo run -p ghost-proxy-client -- relay-submit-package \
+cargo run -p ghostbro-client -- relay-submit-package \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --spa-endpoint 127.0.0.1:5353 \
   --proxy-endpoint 127.0.0.1:8443 \
   --ecosystem crates --name serde --version 1.0.197
 
-cargo run -p ghost-proxy-client -- relay-list \
+cargo run -p ghostbro-client -- relay-list \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --spa-endpoint 127.0.0.1:5353 \
   --proxy-endpoint 127.0.0.1:8443
 
-cargo run -p ghost-proxy-client -- relay-download \
+cargo run -p ghostbro-client -- relay-download \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --spa-endpoint 127.0.0.1:5353 \
@@ -298,7 +298,7 @@ cargo run -p ghost-proxy-client -- relay-download \
   --output ./relay-result.body \
   --artifact primary              # or "markdown" for the normalized copy
 
-cargo run -p ghost-proxy-client -- relay-delete \
+cargo run -p ghostbro-client -- relay-delete \
   --identity-key /tmp/ghost-debug.key \
   --server-key /tmp/ghost-server-noise.pub \
   --spa-endpoint 127.0.0.1:5353 \

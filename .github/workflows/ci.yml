@@ -21,7 +21,7 @@ jobs:
   # Fast userspace gate on stable. `cargo {fmt,clippy,test}` resolve to the
   # workspace default-members (server, client, common, bpf-common), so the
   # nightly-only eBPF crate is intentionally NOT pulled in here — never use
-  # `--workspace` on stable, it fails to compile ghost-proxy-ebpf.
+  # `--workspace` on stable, it fails to compile ghostbro-ebpf.
   check:
     name: fmt + clippy + test (stable)
     runs-on: ubuntu-latest
@@ -72,6 +72,6 @@ jobs:
       - name: Upload eBPF object
         uses: actions/upload-artifact@v4
         with:
-          name: ghost-proxy-ebpf
-          path: target/bpfel-unknown-none/release/ghost-proxy-ebpf
+          name: ghostbro-ebpf
+          path: target/bpfel-unknown-none/release/ghostbro-ebpf
           if-no-files-found: error

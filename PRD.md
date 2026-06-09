@@ -1,4 +1,4 @@
-# Ghost Proxy: Censorship-Resistant Encrypted Proxy with eBPF Stealth Layer
+# Ghostbro: Censorship-Resistant Encrypted Proxy with eBPF Stealth Layer
 
 ## Specification v0.2 — DRAFT
 
@@ -8,7 +8,7 @@
 
 In regions where governments impose internet shutdowns or deep packet inspection (DPI), users need a proxy that is both functional and invisible. Existing solutions (Tor, Shadowsocks, vanilla VPNs) have known protocol fingerprints that state-level adversaries actively detect and block. A proxy that can be identified is a proxy that can be blocked — and in some jurisdictions, a proxy that can get its operator arrested.
 
-Ghost Proxy addresses this by combining three layers: kernel-level traffic gating via eBPF that makes the proxy invisible to unauthorized observers, Single Packet Authorization (SPA) with asymmetric key authentication that limits the blast radius of key compromise, and a decoy service that presents a plausible cover identity to active probing.
+Ghostbro addresses this by combining three layers: kernel-level traffic gating via eBPF that makes the proxy invisible to unauthorized observers, Single Packet Authorization (SPA) with asymmetric key authentication that limits the blast radius of key compromise, and a decoy service that presents a plausible cover identity to active probing.
 
 ## 2. Design Goals
 
@@ -23,7 +23,7 @@ Ghost Proxy addresses this by combining three layers: kernel-level traffic gatin
 
 ## 3. Architecture Overview
 
-Ghost Proxy supports two SPA modes. The operator and client select the mode based on the network environment.
+Ghostbro supports two SPA modes. The operator and client select the mode based on the network environment.
 
 ### 3.1 Standard SPA Mode (UDP)
 
@@ -124,7 +124,7 @@ SPA payload delivered as the body of an HTTPS POST to the decoy web service. The
 
 ### 4.1 SPA Principles
 
-Ghost Proxy's SPA implementation follows established SPA principles (as formalized by fwknop and the SPA RFC draft) with asymmetric cryptography:
+Ghostbro's SPA implementation follows established SPA principles (as formalized by fwknop and the SPA RFC draft) with asymmetric cryptography:
 
 1. **Single packet**: Authorization requires exactly one packet (UDP datagram or HTTPS POST body). No multi-packet sequences, no handshakes, no challenge-response.
 
@@ -140,7 +140,7 @@ Ghost Proxy's SPA implementation follows established SPA principles (as formaliz
 
 ### 4.2 SPA vs. Traditional Port Knocking
 
-Ghost Proxy uses SPA, not port knocking. The distinction matters:
+Ghostbro uses SPA, not port knocking. The distinction matters:
 
 | Property | Port Knocking | SPA |
 |----------|--------------|-----|
@@ -413,7 +413,7 @@ Listens on the proxy port (default 8443). Only reachable after SPA authorization
 **Client:**
 
 ```bash
-ghost-proxy keygen --output ~/.ghost-proxy/identity
+ghostbro keygen --output ~/.ghost-proxy/identity
 # Generates:
 #   ~/.ghost-proxy/identity.key     (Ed25519 private key, encrypted via argon2id)
 #   ~/.ghost-proxy/identity.pub     (Ed25519 public key, base64, 44 chars)
@@ -426,7 +426,7 @@ Private key encrypted at rest with a user-chosen passphrase. KDF: argon2id (m=64
 **Server:**
 
 ```bash
-ghost-proxy server-keygen --output /etc/ghost-proxy/server
+ghostbro server-keygen --output /etc/ghost-proxy/server
 # Generates:
 #   /etc/ghost-proxy/server.key      (Ed25519 + Curve25519 private keys)
 #   /etc/ghost-proxy/server.pub      (public keys, base64)
@@ -460,7 +460,7 @@ ghost-proxy server-keygen --output /etc/ghost-proxy/server
    │  ◄──────────────────────────►    │
    │                                  │
    │  7. Configure client:            │
-   │     ghost-proxy enroll           │
+   │     ghostbro enroll           │
    │       --server-key <base64>      │
    │       --endpoint <ip:port>       │
    │       --spa-mode <udp|https>     │
@@ -478,17 +478,17 @@ Remove the client entry from `authorized_keys.toml`. The daemon detects the chan
 
 ```bash
 # Generate identity
-ghost-proxy keygen --output ~/.ghost-proxy/identity
+ghostbro keygen --output ~/.ghost-proxy/identity
 
 # Enroll with a server
-ghost-proxy enroll \
+ghostbro enroll \
   --server-key "base64..." \
   --endpoint 203.0.113.42:8443 \
   --spa-mode udp \
   --spa-port 53
 
 # Connect (SPA + tunnel + local SOCKS5 listener)
-ghost-proxy connect \
+ghostbro connect \
   --config ~/.ghost-proxy/servers/myserver.toml \
   --listen 127.0.0.1:1080
 # 1. Prompts for passphrase
@@ -497,14 +497,14 @@ ghost-proxy connect \
 # 4. Starts local SOCKS5 proxy on 1080
 
 # Connect with explicit SPA mode override
-ghost-proxy connect \
+ghostbro connect \
   --config ~/.ghost-proxy/servers/myserver.toml \
   --spa-mode https \
   --listen 127.0.0.1:1080
 # Overrides configured SPA mode (useful when network conditions change)
 
 # Revoke own key (best-effort notification to server)
-ghost-proxy revoke --config ~/.ghost-proxy/servers/myserver.toml
+ghostbro revoke --config ~/.ghost-proxy/servers/myserver.toml
 ```
 
 Implementation note: the proxy server and client-side local listener use `fast-socks5`; current SOCKS5 support remains no-auth TCP CONNECT over the Noise IK tunnel.
@@ -658,20 +658,20 @@ The `mode = "both"` option enables both UDP and HTTPS SPA simultaneously. The XD
 ## 12. Project Structure
 
 ```
-ghost-proxy/
+ghostbro/
 ├── Cargo.toml                    # Workspace
-├── ghost-proxy-ebpf/             # eBPF XDP program (aya-ebpf)
+├── ghostbro-ebpf/             # eBPF XDP program (aya-ebpf)
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs               # XDP filter, SPA pre-filter, allow-map check
-├── ghost-proxy-common/           # Shared types
+├── ghostbro-common/           # Shared types
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
 │       ├── spa.rs                # SPA packet format, construction, parsing
 │       ├── keys.rs               # Key types, key_id derivation
 │       └── protocol.rs           # Wire format constants, version
-├── ghost-proxy-server/           # Server daemon
+├── ghostbro-server/           # Server daemon
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs               # Entrypoint, config, orchestration
@@ -682,7 +682,7 @@ ghost-proxy/
 │       ├── proxy.rs              # fast-socks5 + Noise IK tunnel
 │       ├── decoy.rs              # Decoy HTTPS server
 │       └── keys.rs               # Authorized keys, hot reload
-├── ghost-proxy-client/           # Client CLI
+├── ghostbro-client/           # Client CLI
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs               # CLI entrypoint (clap)
@@ -724,7 +724,7 @@ Allow-map is keyed on source IP. Clients behind CGNAT may share IPs or have IP c
 
 ### 13.5 Recommended Use Cases
 
-Ghost Proxy is optimized for protocols with small, non-identifying request payloads:
+Ghostbro is optimized for protocols with small, non-identifying request payloads:
 
 | Use Case | Request Size | Response Profile | Metadata Risk |
 |----------|-------------|-----------------|---------------|
@@ -743,7 +743,7 @@ Web browsing through raw SOCKS5 is supported but not recommended. The Content Re
 - **UDP ASSOCIATE**: SOCKS5 UDP forwarding through the Noise tunnel.
 - **Traffic shaping / padding**: Constant-rate traffic to resist flow analysis.
 - **Multi-node deployment**: Signed authorized-keys snapshots across 2–5 nodes.
-- **Multi-hop**: Chain multiple Ghost Proxy instances.
+- **Multi-hop**: Chain multiple Ghostbro instances.
 - **Mobile client**: iOS/Android with tun2socks integration.
 - **Meshtastic enrollment**: QR-code key exchange over LoRa.
 - **Pluggable transports**: obfs4-style wire format for high-entropy-flagging environments.

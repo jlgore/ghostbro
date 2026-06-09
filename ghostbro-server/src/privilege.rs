@@ -1,6 +1,6 @@
 //! Startup privilege reporting (PRD §13.4 server hardening).
 //!
-//! Ghost Proxy's eBPF loader needs `CAP_BPF` + `CAP_NET_ADMIN` (and
+//! Ghostbro's eBPF loader needs `CAP_BPF` + `CAP_NET_ADMIN` (and
 //! `CAP_NET_BIND_SERVICE` to bind the builtin decoy on :443). The recommended
 //! deployment runs the daemon as an **unprivileged user** with exactly those
 //! ambient capabilities via the systemd unit in `deploy/ghost-proxy.service`,
@@ -18,7 +18,7 @@
 
 use std::fs;
 
-/// Capabilities relevant to Ghost Proxy, with their Linux capability numbers.
+/// Capabilities relevant to Ghostbro, with their Linux capability numbers.
 const KNOWN_CAPS: &[(u8, &str)] = &[
     (10, "CAP_NET_BIND_SERVICE"),
     (12, "CAP_NET_ADMIN"),
@@ -28,7 +28,7 @@ const KNOWN_CAPS: &[(u8, &str)] = &[
     (39, "CAP_BPF"),
 ];
 
-/// The capabilities Ghost Proxy actually needs at runtime.
+/// The capabilities Ghostbro actually needs at runtime.
 const REQUIRED_CAPS: &[&str] = &["CAP_BPF", "CAP_NET_ADMIN"];
 
 #[derive(Debug, PartialEq, Eq)]

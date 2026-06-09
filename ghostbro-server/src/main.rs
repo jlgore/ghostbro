@@ -23,8 +23,8 @@ mod relay;
 mod spa;
 
 #[derive(Debug, Parser)]
-#[command(name = "ghost-proxy-server")]
-#[command(about = "Ghost Proxy server daemon")]
+#[command(name = "ghostbro-server")]
+#[command(about = "Ghostbro server daemon")]
 struct Cli {
     /// Server configuration path.
     #[arg(long, default_value = "/etc/ghost-proxy/ghost-proxy.toml")]
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         tracing::info!(config = %cli.config, decoy_bind = %decoy_bind, spa_path = %config.spa.https_path(), "starting built-in decoy server");
 
         let (https_spa_tx, https_spa_rx) = mpsc::channel(1024);
-        let https_spa_tx = if config.spa.bpf_mode() & ghost_proxy_bpf_common::SPA_MODE_HTTPS != 0 {
+        let https_spa_tx = if config.spa.bpf_mode() & ghostbro_bpf_common::SPA_MODE_HTTPS != 0 {
             Some(https_spa_tx)
         } else {
             None
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
             allow_missing_counter_state,
         )?;
         let allowed_sources = Arc::new(RwLock::new(HashMap::new()));
-        let bpf_config = ghost_proxy_bpf_common::BpfConfig {
+        let bpf_config = ghostbro_bpf_common::BpfConfig {
             spa_port: config.spa.udp_port(),
             proxy_port: config.proxy.port,
             rate_limit_per_minute: config.spa.udp_rate_limit(),
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
             bpf_config,
             allowed_sources.clone(),
         )?;
-        tracing::info!(iface = %cli.iface, ebpf_object, "attached Ghost Proxy XDP program");
+        tracing::info!(iface = %cli.iface, ebpf_object, "attached Ghostbro XDP program");
         let proxy_bind = proxy_bind_address(&config);
         let relay_engine = relay::RelayEngine::start(relay_config(&config));
 

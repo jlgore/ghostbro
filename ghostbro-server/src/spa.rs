@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
-use ghost_proxy_common::{
+use ghostbro_common::{
     keys::{key_id_from_hex, key_id_hex, KeyId},
     spa::{SpaError, SpaMode, SpaPacket},
 };
@@ -243,7 +243,7 @@ fn save_counter_state(path: &Path, counters: &HashMap<KeyId, u64>) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use ghost_proxy_common::{
+    use ghostbro_common::{
         keys::{derive_noise_static_public_key, generate_ed25519_keypair},
         spa::SpaPacket,
     };
@@ -255,7 +255,7 @@ mod tests {
 
     fn client_from_key(name: &str, signing_key: &SigningKey) -> AuthorizedClient {
         let public_key = signing_key.verifying_key();
-        let key_id = ghost_proxy_common::keys::key_id_for_public_key(&public_key);
+        let key_id = ghostbro_common::keys::key_id_for_public_key(&public_key);
 
         AuthorizedClient {
             name: name.to_owned(),
@@ -409,7 +409,7 @@ mod tests {
 
     fn temp_counter_state_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "ghost-proxy-spa-counters-{}.toml",
+            "ghostbro-spa-counters-{}.toml",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")

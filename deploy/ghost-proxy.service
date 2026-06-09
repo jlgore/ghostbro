@@ -1,4 +1,4 @@
-# Ghost Proxy server — hardened systemd unit (PRD §13.4).
+# Ghostbro server — hardened systemd unit (PRD §13.4).
 #
 # This realizes the "proxy runs as an unprivileged user; only the eBPF loader
 # needs CAP_BPF / CAP_NET_ADMIN" requirement: the daemon never runs as root.
@@ -7,24 +7,24 @@
 #
 # Setup:
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ghost-proxy
-#   sudo install -Dm755 target/release/ghost-proxy-server /usr/local/bin/ghost-proxy-server
-#   sudo install -Dm644 target/bpfel-unknown-none/release/ghost-proxy-ebpf \
-#       /usr/local/lib/ghost-proxy/ghost-proxy-ebpf
+#   sudo install -Dm755 target/release/ghostbro-server /usr/local/bin/ghostbro-server
+#   sudo install -Dm644 target/bpfel-unknown-none/release/ghostbro-ebpf \
+#       /usr/local/lib/ghost-proxy/ghostbro-ebpf
 #   # /var/lib/ghost-proxy (relay spool, counters) and /var/log/ghost-proxy are
 #   # created and owned by the service user via StateDirectory/LogsDirectory below.
 #   sudo systemctl daemon-reload && sudo systemctl enable --now ghost-proxy
 
 [Unit]
-Description=Ghost Proxy server (SPA + Noise IK proxy + eBPF XDP)
+Description=Ghostbro server (SPA + Noise IK proxy + eBPF XDP)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ghost-proxy-server \
+ExecStart=/usr/local/bin/ghostbro-server \
     --config /etc/ghost-proxy/ghost-proxy.toml \
     --iface eth0 \
-    --ebpf-object /usr/local/lib/ghost-proxy/ghost-proxy-ebpf
+    --ebpf-object /usr/local/lib/ghost-proxy/ghostbro-ebpf
 Restart=on-failure
 RestartSec=5
 

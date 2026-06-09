@@ -904,14 +904,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-proxy-bpf-common"
+name = "ghostbro-bpf-common"
 version = "0.1.0"
 dependencies = [
  "aya",
 ]
 
 [[package]]
-name = "ghost-proxy-client"
+name = "ghostbro-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -921,7 +921,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "fast-socks5",
- "ghost-proxy-common",
+ "ghostbro-common",
  "httpdate",
  "rand 0.8.6",
  "reqwest",
@@ -935,7 +935,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-proxy-common"
+name = "ghostbro-common"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -948,17 +948,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-proxy-ebpf"
+name = "ghostbro-ebpf"
 version = "0.1.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
- "ghost-proxy-bpf-common",
+ "ghostbro-bpf-common",
  "network-types",
 ]
 
 [[package]]
-name = "ghost-proxy-server"
+name = "ghostbro-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -969,8 +969,8 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "fast-socks5",
- "ghost-proxy-bpf-common",
- "ghost-proxy-common",
+ "ghostbro-bpf-common",
+ "ghostbro-common",
  "httpdate",
  "ipnet",
  "libc",
@@ -2828,7 +2828,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "ghost-proxy-common",
+ "ghostbro-common",
 ]
 
 [[package]]

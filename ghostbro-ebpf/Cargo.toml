@@ -1,15 +1,15 @@
 [package]
-name = "ghost-proxy-ebpf"
+name = "ghostbro-ebpf"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "ghost-proxy-ebpf"
+name = "ghostbro-ebpf"
 path = "src/main.rs"
 
 [dependencies]
 aya-ebpf = { version = "0.1.1", features = ["const_assert"] }
 aya-log-ebpf = "0.1"
-ghost-proxy-bpf-common = { path = "../ghost-proxy-bpf-common" }
+ghostbro-bpf-common = { path = "../ghostbro-bpf-common" }
 network-types = "0.2"

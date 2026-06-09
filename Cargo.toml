@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "ghost-proxy-bpf-common",
-    "ghost-proxy-common",
-    "ghost-proxy-client",
-    "ghost-proxy-server",
-    "ghost-proxy-ebpf",
+    "ghostbro-bpf-common",
+    "ghostbro-common",
+    "ghostbro-client",
+    "ghostbro-server",
+    "ghostbro-ebpf",
     "xtask",
 ]
 default-members = [
-    "ghost-proxy-bpf-common",
-    "ghost-proxy-common",
-    "ghost-proxy-client",
-    "ghost-proxy-server",
+    "ghostbro-bpf-common",
+    "ghostbro-common",
+    "ghostbro-client",
+    "ghostbro-server",
 ]
 
 [workspace.package]

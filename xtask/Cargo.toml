@@ -11,4 +11,4 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-ghost-proxy-common = { path = "../ghost-proxy-common" }
+ghostbro-common = { path = "../ghostbro-common" }

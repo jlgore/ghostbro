@@ -1,8 +1,8 @@
-# Threat Model: Ghost Proxy
+# Threat Model: Ghostbro
 
 ## 1. System context
 
-Ghost Proxy is a censorship-resistant encrypted proxy whose primary security
+Ghostbro is a censorship-resistant encrypted proxy whose primary security
 property is *invisibility*: to any unauthorized observer the host looks like an
 ordinary web server, and the proxy service is unreachable until a client proves
 authorization. An XDP/eBPF program at the network edge drops all traffic to the

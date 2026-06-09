@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ghost_proxy_common::keys::{
+use ghostbro_common::keys::{
     derive_noise_static_public_key, encode_noise_public_key, encode_public_key, encode_signing_key,
     generate_ed25519_keypair, key_id_for_public_key, key_id_hex,
 };
@@ -331,7 +331,7 @@ fn build_ebpf() -> Result<()> {
             "+nightly",
             "build",
             "-p",
-            "ghost-proxy-ebpf",
+            "ghostbro-ebpf",
             "--target",
             "bpfel-unknown-none",
             "--release",
@@ -529,7 +529,7 @@ fn print_loopback_instructions(
     println!();
     println!("2. Start the server in one terminal:");
     println!(
-        "   sudo RUST_LOG=debug target/debug/ghost-proxy-server --config {} --iface {} --ebpf-object target/bpfel-unknown-none/release/ghost-proxy-ebpf --decoy-bind {}",
+        "   sudo RUST_LOG=debug target/debug/ghostbro-server --config {} --iface {} --ebpf-object target/bpfel-unknown-none/release/ghostbro-ebpf --decoy-bind {}",
         fixture.server_config.display(),
         iface,
         decoy_bind
@@ -537,7 +537,7 @@ fn print_loopback_instructions(
     println!();
     println!("3. Send one SPA packet from another terminal:");
     println!(
-        "   cargo run -p ghost-proxy-client -- send-udp-spa --identity-key {} --server-key {} --endpoint 127.0.0.1:{}",
+        "   cargo run -p ghostbro-client -- send-udp-spa --identity-key {} --server-key {} --endpoint 127.0.0.1:{}",
         fixture.key_path.display(),
         public_key_path(&fixture.server_noise_key).display(),
         spa_port
@@ -550,7 +550,7 @@ fn print_loopback_instructions(
         public_key_path(&fixture.server_noise_key).display()
     );
     println!(
-        "   cargo run -p ghost-proxy-client -- connect-once --identity-key {} --server-key {} --spa-endpoint 127.0.0.1:{} --proxy-endpoint 127.0.0.1:{} --message \"hello ghost\"",
+        "   cargo run -p ghostbro-client -- connect-once --identity-key {} --server-key {} --spa-endpoint 127.0.0.1:{} --proxy-endpoint 127.0.0.1:{} --message \"hello ghost\"",
         fixture.key_path.display(),
         public_key_path(&fixture.server_noise_key).display(),
         spa_port,
@@ -730,10 +730,10 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
             "GHOST_PROXY_RELAY_SPOOL_DIR={}-relay-spool",
             config.identity_prefix.display()
         ));
-        command.arg("./target/debug/ghost-proxy-server");
+        command.arg("./target/debug/ghostbro-server");
         command
     } else {
-        let mut command = Command::new("./target/debug/ghost-proxy-server");
+        let mut command = Command::new("./target/debug/ghostbro-server");
         command.env("RUST_LOG", "debug");
         command.env("GHOST_PROXY_DISABLE_AUTH_WATCH", "1");
         command
@@ -753,7 +753,7 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
         .arg("--iface")
         .arg(&config.iface)
         .arg("--ebpf-object")
-        .arg("target/bpfel-unknown-none/release/ghost-proxy-ebpf")
+        .arg("target/bpfel-unknown-none/release/ghostbro-ebpf")
         .arg("--decoy-bind")
         .arg(&config.decoy_bind)
         .stdout(Stdio::piped())
@@ -775,7 +775,7 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
 
 fn run_client_smoke(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<()> {
     let output = Command::new("cargo")
-        .args(["run", "-p", "ghost-proxy-client", "--", "connect-once"])
+        .args(["run", "-p", "ghostbro-client", "--", "connect-once"])
         .arg("--identity-key")
         .arg(&fixture.key_path)
         .arg("--server-key")
@@ -814,7 +814,7 @@ fn run_client_socks5_smoke(
         .args([
             "run",
             "-p",
-            "ghost-proxy-client",
+            "ghostbro-client",
             "--",
             "connect-socks5-once",
         ])
@@ -991,7 +991,7 @@ fn relay_client_command(
 ) -> Command {
     let mut command = Command::new("cargo");
     command
-        .args(["run", "-p", "ghost-proxy-client", "--", subcommand])
+        .args(["run", "-p", "ghostbro-client", "--", subcommand])
         .arg("--identity-key")
         .arg(&fixture.key_path)
         .arg("--server-key")
@@ -1021,7 +1021,7 @@ fn spawn_client_listener(
     fixture: &LoopbackFixture,
     socks_port: u16,
 ) -> Result<Child> {
-    let mut child = Command::new("./target/debug/ghost-proxy")
+    let mut child = Command::new("./target/debug/ghostbro")
         .arg("connect")
         .arg("--identity-key")
         .arg(&fixture.key_path)

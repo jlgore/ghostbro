@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{fs, path::Path};
 
-use ghost_proxy_common::protocol::{DEFAULT_ALLOW_TTL_SECONDS, DEFAULT_TIME_WINDOW_SECONDS};
+use ghostbro_common::protocol::{DEFAULT_ALLOW_TTL_SECONDS, DEFAULT_TIME_WINDOW_SECONDS};
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
@@ -145,9 +145,9 @@ pub struct RelaySection {
 impl SpaSection {
     pub fn bpf_mode(&self) -> u32 {
         match self.mode {
-            SpaModeConfig::Udp => ghost_proxy_bpf_common::SPA_MODE_UDP,
-            SpaModeConfig::Https => ghost_proxy_bpf_common::SPA_MODE_HTTPS,
-            SpaModeConfig::Both => ghost_proxy_bpf_common::SPA_MODE_BOTH,
+            SpaModeConfig::Udp => ghostbro_bpf_common::SPA_MODE_UDP,
+            SpaModeConfig::Https => ghostbro_bpf_common::SPA_MODE_HTTPS,
+            SpaModeConfig::Both => ghostbro_bpf_common::SPA_MODE_BOTH,
         }
     }
 
@@ -204,14 +204,14 @@ impl SpaSection {
         self.udp
             .as_ref()
             .map(|udp| udp.port)
-            .unwrap_or(ghost_proxy_bpf_common::DEFAULT_SPA_PORT)
+            .unwrap_or(ghostbro_bpf_common::DEFAULT_SPA_PORT)
     }
 
     pub fn udp_rate_limit(&self) -> u32 {
         self.udp
             .as_ref()
             .and_then(|udp| udp.rate_limit)
-            .unwrap_or(ghost_proxy_bpf_common::DEFAULT_RATE_LIMIT_PER_MINUTE)
+            .unwrap_or(ghostbro_bpf_common::DEFAULT_RATE_LIMIT_PER_MINUTE)
     }
 }
 

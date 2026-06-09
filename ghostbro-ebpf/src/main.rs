@@ -8,7 +8,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, RingBuf},
     programs::XdpContext,
 };
-use ghost_proxy_bpf_common::{
+use ghostbro_bpf_common::{
     AllowEntry, BpfConfig, RateState, SpaEvent, DEFAULT_PROXY_PORT, DEFAULT_RATE_LIMIT_PER_MINUTE,
     DEFAULT_SPA_PORT, SPA_MAX_LEN, SPA_MIN_LEN, SPA_MODE_UDP, SPA_RESERVED_FLAGS,
     SPA_VERSION_PREFIX,
@@ -56,14 +56,14 @@ static GLOBAL_RATE: Array<RateState> = Array::with_max_entries(1, 0);
 static SPA_RING: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 #[xdp]
-pub fn ghost_proxy_xdp(ctx: XdpContext) -> u32 {
-    match try_ghost_proxy_xdp(ctx) {
+pub fn ghostbro_xdp(ctx: XdpContext) -> u32 {
+    match try_ghostbro_xdp(ctx) {
         Ok(action) => action,
         Err(_) => xdp_action::XDP_PASS,
     }
 }
 
-fn try_ghost_proxy_xdp(ctx: XdpContext) -> Result<u32, ()> {
+fn try_ghostbro_xdp(ctx: XdpContext) -> Result<u32, ()> {
     let data = ctx.data() as usize;
     let data_end = ctx.data_end() as usize;
     let config = load_config();
