@@ -406,13 +406,33 @@ fn write_loopback_fixture(
     let signing_key = generate_ed25519_keypair();
     let public_key = signing_key.verifying_key();
     let key_id = key_id_for_public_key(&public_key);
-    let noise_public_key = derive_noise_static_public_key(&signing_key);
     let prefix = identity_prefix.to_string_lossy();
     let key_path = PathBuf::from(format!("{prefix}.key"));
     let pub_path = PathBuf::from(format!("{prefix}.pub"));
     let key_id_path = PathBuf::from(format!("{prefix}.keyid"));
     let noise_path = PathBuf::from(format!("{prefix}.noise"));
+    let noise_key_path = PathBuf::from(format!("{prefix}.noise.key"));
     let counter_path = PathBuf::from(format!("{prefix}.counter"));
+
+    // Optionally exercise the independent X25519 Noise static key (§7.1)
+    // end-to-end. Gated by GHOSTBRO_SMOKE_INDEPENDENT_NOISE so the default smoke
+    // run keeps using the derived (legacy) key. Either way we land on the right
+    // `noise_public_key` for authorized_keys.toml below.
+    let noise_public_key = if std::env::var_os("GHOSTBRO_SMOKE_INDEPENDENT_NOISE").is_some() {
+        let noise_private = ghostbro_common::seal::generate_ephemeral();
+        let noise_public = ghostbro_common::seal::x25519_public_from_private(&noise_private);
+        write_private_key_file(
+            &noise_key_path,
+            format!("{}\n", encode_noise_public_key(&noise_private)),
+        )
+        .with_context(|| format!("failed to write {}", noise_key_path.display()))?;
+        noise_public
+    } else {
+        // Remove any stale independent key from a prior run so the client falls
+        // back to the derived key (the fixtures reuse a fixed /tmp prefix).
+        let _ = fs::remove_file(&noise_key_path);
+        derive_noise_static_public_key(&signing_key)
+    };
 
     write_private_key_file(&key_path, format!("{}\n", encode_signing_key(&signing_key)))
         .with_context(|| format!("failed to write {}", key_path.display()))?;
@@ -1036,7 +1056,8 @@ fn spawn_client_listener(
     fixture: &LoopbackFixture,
     socks_port: u16,
 ) -> Result<Child> {
-    let mut child = Command::new("./target/debug/ghostbro")
+    let mut command = Command::new("./target/debug/ghostbro");
+    command
         .arg("connect")
         .arg("--identity-key")
         .arg(&fixture.key_path)
@@ -1047,7 +1068,13 @@ fn spawn_client_listener(
         .arg("--proxy-endpoint")
         .arg(format!("127.0.0.1:{}", config.proxy_port))
         .arg("--listen")
-        .arg(format!("127.0.0.1:{socks_port}"))
+        .arg(format!("127.0.0.1:{socks_port}"));
+    // Optionally exercise the explicit on-path replay binding (§4.6): loopback
+    // is 127.0.0.1, so an explicit --allow-ip 127.0.0.1 must also be accepted.
+    if let Some(allow_ip) = std::env::var_os("GHOSTBRO_SMOKE_ALLOW_IP") {
+        command.arg("--allow-ip").arg(allow_ip);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
