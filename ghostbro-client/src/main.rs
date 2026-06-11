@@ -25,15 +25,14 @@ use ghostbro_common::{
         encode_noise_public_key, encode_public_key, encode_signing_key, generate_ed25519_keypair,
         key_id_for_public_key, key_id_hex,
     },
+    protocol::{DEFAULT_TIME_WINDOW_SECONDS, GHOST_RELAY_STATUS_UNSUPPORTED, PROTOCOL_GHOST_RELAY},
     protocol::{
         GHOST_RELAY_ARTIFACT_NORMALIZED, GHOST_RELAY_ARTIFACT_PRIMARY, GHOST_RELAY_OP_DELETE,
         GHOST_RELAY_OP_DOWNLOAD, GHOST_RELAY_OP_LIST, GHOST_RELAY_OP_SUBMIT_GIT,
         GHOST_RELAY_OP_SUBMIT_PACKAGE, GHOST_RELAY_OP_SUBMIT_WEB, GHOST_RELAY_STATUS_OK,
         GHOST_RELAY_STATUS_PENDING, GHOST_RELAY_VERSION,
     },
-    protocol::{
-        DEFAULT_TIME_WINDOW_SECONDS, GHOST_RELAY_STATUS_UNSUPPORTED, PROTOCOL_GHOST_RELAY,
-    },
+    seal::SealTransport,
     spa::{SpaAllowIp, SpaMode, SpaPacket},
 };
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
@@ -84,6 +83,11 @@ enum Command {
         spa_mode: SpaTransport,
         #[arg(long)]
         spa_port: u16,
+        /// Sealed-SPA ephemeral wire encoding (§14): `raw` (default) or
+        /// `obfuscated` (Elligator2-uniform). Must match the server's
+        /// `[spa] transport`.
+        #[arg(long, value_enum, default_value_t = TransportArg::Raw)]
+        transport: TransportArg,
         /// Output TOML path for the enrolled server config.
         #[arg(long, default_value = "servers.toml")]
         output: String,
@@ -378,6 +382,25 @@ enum SpaTransport {
     Https,
 }
 
+/// CLI surface for the sealed-SPA ephemeral wire encoding (§4.3, §14). Converts
+/// to [`SealTransport`]; the config persists `SealTransport` directly. Renders as
+/// `raw` / `obfuscated` on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum TransportArg {
+    #[default]
+    Raw,
+    Obfuscated,
+}
+
+impl From<TransportArg> for SealTransport {
+    fn from(value: TransportArg) -> Self {
+        match value {
+            TransportArg::Raw => SealTransport::Raw,
+            TransportArg::Obfuscated => SealTransport::Obfuscated,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum RelayArtifact {
     Primary,
@@ -407,6 +430,16 @@ struct ServerConfigEntry {
     spa_port: u16,
     server_public_key: String,
     priority: Option<u32>,
+    /// Sealed-SPA ephemeral wire encoding (§4.3, §14). Omitted → `raw`
+    /// (backward-compatible). Must match the server's `[spa] transport`.
+    #[serde(default, skip_serializing_if = "is_raw_transport")]
+    transport: SealTransport,
+}
+
+/// Skip serializing the default transport so existing/raw configs stay
+/// byte-identical (no surprise `transport = "raw"` line on re-enroll).
+fn is_raw_transport(transport: &SealTransport) -> bool {
+    matches!(transport, SealTransport::Raw)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -482,6 +515,8 @@ struct ResolvedConnectConfig {
     proxy_endpoint: SocketAddr,
     spa_mode: SpaTransport,
     https_spa_url: Option<String>,
+    /// Sealed-SPA ephemeral wire encoding for this candidate (§14).
+    transport: SealTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -523,8 +558,16 @@ fn main() -> Result<()> {
             endpoint,
             spa_mode,
             spa_port,
+            transport,
             output,
-        } => enroll(&server_key, &endpoint, spa_mode, spa_port, &output),
+        } => enroll(
+            &server_key,
+            &endpoint,
+            spa_mode,
+            spa_port,
+            transport.into(),
+            &output,
+        ),
         Command::Connect {
             config,
             identity_key,
@@ -570,6 +613,7 @@ fn main() -> Result<()> {
                 &server_static_pubkey,
                 endpoint,
                 counter_file.as_deref(),
+                SealTransport::Raw,
             )
         }
         Command::SendHttpsSpa {
@@ -584,6 +628,7 @@ fn main() -> Result<()> {
                 &server_static_pubkey,
                 &url,
                 counter_file.as_deref(),
+                SealTransport::Raw,
             )
         }
         Command::ConnectOnce {
@@ -856,6 +901,7 @@ fn enroll(
     endpoint: &str,
     spa_mode: SpaTransport,
     spa_port: u16,
+    transport: SealTransport,
     output: &str,
 ) -> Result<()> {
     decode_noise_public_key(server_key)
@@ -871,6 +917,7 @@ fn enroll(
             spa_port,
             server_public_key: server_key.to_owned(),
             priority: Some(1),
+            transport,
         }],
         failover: Some(FailoverConfig {
             strategy: "priority".to_owned(),
@@ -974,6 +1021,7 @@ fn resolve_connect_configs(
                     proxy_endpoint,
                     spa_mode,
                     https_spa_url,
+                    transport: server.transport,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -994,6 +1042,9 @@ fn resolve_connect_configs(
         proxy_endpoint,
         spa_mode,
         https_spa_url: https_spa_url_override.map(str::to_owned),
+        // No-config direct connect has no enrolled transport; default to raw.
+        // (Operators wanting obfuscated connect via flags should enroll first.)
+        transport: SealTransport::Raw,
     }];
     Ok((resolved, FailoverPolicy::default()))
 }
@@ -1053,6 +1104,7 @@ fn send_udp_spa(
     server_static_pubkey: &[u8; 32],
     endpoint: SocketAddr,
     counter_file: Option<&str>,
+    transport: SealTransport,
 ) -> Result<()> {
     let signing_key = read_signing_key(identity_key)?;
     let counter_path = counter_file
@@ -1070,6 +1122,7 @@ fn send_udp_spa(
         counter,
         SpaAllowIp::PacketSource,
         server_static_pubkey,
+        transport,
     );
 
     let socket = UdpSocket::bind(if endpoint.is_ipv4() {
@@ -1097,6 +1150,7 @@ fn send_https_spa(
     server_static_pubkey: &[u8; 32],
     url: &str,
     counter_file: Option<&str>,
+    transport: SealTransport,
 ) -> Result<()> {
     let signing_key = read_signing_key(identity_key)?;
     let counter_path = counter_file
@@ -1111,6 +1165,7 @@ fn send_https_spa(
         counter,
         SpaAllowIp::PacketSource,
         server_static_pubkey,
+        transport,
     );
 
     let response = reqwest::blocking::Client::new()
@@ -1233,6 +1288,9 @@ fn connect_once(
         spa_mode,
         https_spa_url,
         counter_file,
+        // Dev/one-shot helpers always use the raw transport; the obfuscated
+        // transport is driven through `enroll`/`connect` config (§14).
+        SealTransport::Raw,
     )?;
     thread::sleep(Duration::from_millis(150));
 
@@ -1317,6 +1375,9 @@ fn connect_socks5_once(
         spa_mode,
         https_spa_url,
         counter_file,
+        // Dev/one-shot helpers always use the raw transport; the obfuscated
+        // transport is driven through `enroll`/`connect` config (§14).
+        SealTransport::Raw,
     )?;
 
     write_encrypted_frame(&mut stream, &mut transport, &[0x05, 0x01, 0x00], &mut buf)?;
@@ -1367,6 +1428,9 @@ fn connect_ghost_relay_once(
         spa_mode,
         https_spa_url,
         counter_file,
+        // Dev/one-shot helpers always use the raw transport; the obfuscated
+        // transport is driven through `enroll`/`connect` config (§14).
+        SealTransport::Raw,
     )?;
 
     write_encrypted_frame(
@@ -1613,6 +1677,9 @@ fn run_relay_request(
         spa_mode,
         https_spa_url,
         counter_file,
+        // Dev/one-shot helpers always use the raw transport; the obfuscated
+        // transport is driven through `enroll`/`connect` config (§14).
+        SealTransport::Raw,
     )?;
     write_encrypted_frame(&mut stream, &mut transport, request, &mut buf)?;
     read_encrypted_frame(&mut stream, &mut transport, &mut buf)
@@ -1763,10 +1830,9 @@ fn start_spa_refresh(
                             candidate.spa_mode,
                             candidate.https_spa_url.as_deref(),
                             counter_file.as_deref(),
+                            candidate.transport,
                         ),
-                        Err(_) => Err(anyhow::anyhow!(
-                            "server Noise public key must be 32 bytes"
-                        )),
+                        Err(_) => Err(anyhow::anyhow!("server Noise public key must be 32 bytes")),
                     }
                 };
 
@@ -2017,6 +2083,9 @@ fn relay_local_socks5(
     Ok(())
 }
 
+// SPA send parameters + the proxy endpoint + transport are each independent
+// connection inputs; threading them as one struct would not aid the reader.
+#[allow(clippy::too_many_arguments)]
 fn connect_noise(
     identity_key: &str,
     server_public_key: &[u8],
@@ -2025,6 +2094,7 @@ fn connect_noise(
     spa_mode: SpaTransport,
     https_spa_url: Option<&str>,
     counter_file: Option<&str>,
+    transport: SealTransport,
 ) -> Result<(
     TcpStream,
     snow::TransportState,
@@ -2041,6 +2111,7 @@ fn connect_noise(
         spa_mode,
         https_spa_url,
         counter_file,
+        transport,
     )?;
     thread::sleep(Duration::from_millis(150));
 
@@ -2124,6 +2195,7 @@ fn connect_noise_with_failover(
                 candidate.spa_mode,
                 candidate.https_spa_url.as_deref(),
                 counter_file,
+                candidate.transport,
             ) {
                 Ok((stream, transport, buf, key_id)) => {
                     if !(round == 0 && position == 0) {
@@ -2132,7 +2204,14 @@ fn connect_noise_with_failover(
                             candidate.proxy_endpoint, policy.strategy
                         );
                     }
-                    return Ok((stream, transport, buf, key_id, index, candidate.proxy_endpoint));
+                    return Ok((
+                        stream,
+                        transport,
+                        buf,
+                        key_id,
+                        index,
+                        candidate.proxy_endpoint,
+                    ));
                 }
                 Err(error) => {
                     eprintln!(
@@ -2166,7 +2245,10 @@ fn connect_noise_with_failover(
 
 /// Order candidate indices for one connection round per the failover strategy.
 /// Candidates arrive in priority order, so `priority` is the identity order.
-fn order_candidates(strategy: FailoverStrategy, candidates: &[ResolvedConnectConfig]) -> Vec<usize> {
+fn order_candidates(
+    strategy: FailoverStrategy,
+    candidates: &[ResolvedConnectConfig],
+) -> Vec<usize> {
     match strategy {
         FailoverStrategy::Priority => (0..candidates.len()).collect(),
         FailoverStrategy::Random => {
@@ -2221,14 +2303,25 @@ fn send_spa(
     spa_mode: SpaTransport,
     https_spa_url: Option<&str>,
     counter_file: Option<&str>,
+    transport: SealTransport,
 ) -> Result<()> {
     match spa_mode {
-        SpaTransport::Udp => {
-            send_udp_spa(identity_key, server_static_pubkey, spa_endpoint, counter_file)
-        }
+        SpaTransport::Udp => send_udp_spa(
+            identity_key,
+            server_static_pubkey,
+            spa_endpoint,
+            counter_file,
+            transport,
+        ),
         SpaTransport::Https => {
             let url = https_spa_url.context("--https-spa-url is required when --spa-mode https")?;
-            send_https_spa(identity_key, server_static_pubkey, url, counter_file)
+            send_https_spa(
+                identity_key,
+                server_static_pubkey,
+                url,
+                counter_file,
+                transport,
+            )
         }
     }
 }
@@ -2342,9 +2435,12 @@ fn read_noise_public_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
 /// SPA signatures (authenticated associated data, not transmitted on the wire).
 fn read_noise_public_key_array(path: impl AsRef<Path>) -> Result<[u8; 32]> {
     let key = read_noise_public_key(path)?;
-    key.as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("server Noise public key must be 32 bytes, got {}", key.len()))
+    key.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "server Noise public key must be 32 bytes, got {}",
+            key.len()
+        )
+    })
 }
 
 fn decode_noise_public_key(encoded: &str) -> Result<Vec<u8>> {
@@ -2677,7 +2773,10 @@ mod tests {
         let path = temp_path("counter-floor");
 
         let floor = 1_725_000_000_000;
-        assert_eq!(floor, next_counter(&path, floor).expect("derives from floor"));
+        assert_eq!(
+            floor,
+            next_counter(&path, floor).expect("derives from floor")
+        );
         // Subsequent counter is strictly greater even with the same floor.
         assert_eq!(
             floor + 1,
@@ -2863,6 +2962,7 @@ mod tests {
                     spa_port: 5353,
                     server_public_key: STANDARD.encode([1u8; 32]),
                     priority: Some(2),
+                    transport: SealTransport::Raw,
                 },
                 ServerConfigEntry {
                     endpoint: "127.0.0.1:9443".to_owned(),
@@ -2871,6 +2971,7 @@ mod tests {
                     spa_port: 443,
                     server_public_key: STANDARD.encode([2u8; 32]),
                     priority: Some(1),
+                    transport: SealTransport::Raw,
                 },
             ],
             failover: None,
@@ -2941,6 +3042,7 @@ mod tests {
                 proxy_endpoint: format!("127.0.0.1:{}", 8000 + index).parse().unwrap(),
                 spa_mode: SpaTransport::Udp,
                 https_spa_url: None,
+                transport: SealTransport::Raw,
             })
             .collect()
     }
@@ -3051,6 +3153,7 @@ mod tests {
             spa_port: 443,
             server_public_key: STANDARD.encode([1u8; 32]),
             priority: Some(1),
+            transport: SealTransport::Raw,
         };
 
         assert!(revoke_url_for(&server).is_none());

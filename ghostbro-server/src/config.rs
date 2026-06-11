@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::{fs, path::Path};
 
 use ghostbro_common::protocol::{DEFAULT_ALLOW_TTL_SECONDS, DEFAULT_TIME_WINDOW_SECONDS};
+use ghostbro_common::seal::SealTransport;
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
@@ -32,6 +33,13 @@ pub struct ServerSection {
 #[derive(Debug, Deserialize)]
 pub struct SpaSection {
     pub mode: SpaModeConfig,
+    /// Sealed-SPA ephemeral wire encoding (§4.3, §14): `"raw"` (default,
+    /// backward-compatible) or `"obfuscated"` (Elligator2-uniform). Must match
+    /// the client's per-server `transport`. Single-transport per deployment — a
+    /// packet using the other encoding silently fails to open (no try-both
+    /// timing oracle).
+    #[serde(default)]
+    pub transport: SealTransport,
     pub common: Option<SpaCommonSection>,
     pub udp: Option<SpaUdpSection>,
     pub https: Option<SpaHttpsSection>,
@@ -151,6 +159,10 @@ impl SpaSection {
             SpaModeConfig::Https => ghostbro_bpf_common::SPA_MODE_HTTPS,
             SpaModeConfig::Both => ghostbro_bpf_common::SPA_MODE_BOTH,
         }
+    }
+
+    pub fn seal_transport(&self) -> SealTransport {
+        self.transport
     }
 
     pub fn https_path(&self) -> &str {
@@ -304,6 +316,49 @@ mod tests {
         assert_eq!(
             &["127.0.0.1/32".to_owned()],
             config.spa.trusted_proxy_cidrs()
+        );
+    }
+
+    #[test]
+    fn transport_defaults_to_raw_and_parses_obfuscated() {
+        fn config_with_transport(line: &str) -> ServerConfig {
+            toml::from_str(&format!(
+                r#"
+                [server]
+                identity = "/etc/ghostbro/server.key"
+
+                [spa]
+                mode = "udp"
+                {line}
+
+                [proxy]
+                port = 8443
+                noise_pattern = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
+                bind = "0.0.0.0"
+
+                [clients]
+                authorized_keys = "/etc/ghostbro/authorized_keys.toml"
+                "#
+            ))
+            .expect("valid config")
+        }
+
+        // Omitted → backward-compatible default.
+        assert_eq!(
+            SealTransport::Raw,
+            config_with_transport("").spa.seal_transport()
+        );
+        assert_eq!(
+            SealTransport::Obfuscated,
+            config_with_transport(r#"transport = "obfuscated""#)
+                .spa
+                .seal_transport()
+        );
+        assert_eq!(
+            SealTransport::Raw,
+            config_with_transport(r#"transport = "raw""#)
+                .spa
+                .seal_transport()
         );
     }
 }

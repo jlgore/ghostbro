@@ -638,6 +638,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "curve25519-elligator2"
+version = "0.1.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4df656f503077758f9f06de6e111e921ec8f08f6ce203bd880bc058a47d9d3db"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "curve25519-dalek-derive",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -940,6 +955,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
+ "curve25519-elligator2",
  "ed25519-dalek",
  "rand 0.8.6",
  "serde",

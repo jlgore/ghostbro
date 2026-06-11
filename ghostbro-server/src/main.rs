@@ -81,14 +81,14 @@ async fn main() -> Result<()> {
         let server_static_private = noise::load_static_private_key(&config.server.identity)?;
         // Fail closed on a missing counter-state file unless explicitly
         // initialising a fresh deployment (F-007).
-        let allow_missing_counter_state =
-            std::env::var_os("GHOSTBRO_SPA_COUNTER_INIT").is_some();
+        let allow_missing_counter_state = std::env::var_os("GHOSTBRO_SPA_COUNTER_INIT").is_some();
         let verifier = spa::SpaVerifier::load(
             clients,
             config.spa.time_window_seconds(),
             config.spa.counter_state_path(),
             server_static_private,
             allow_missing_counter_state,
+            config.spa.seal_transport(),
         )?;
         let allowed_sources = Arc::new(RwLock::new(HashMap::new()));
         let bpf_config = ghostbro_bpf_common::BpfConfig {
