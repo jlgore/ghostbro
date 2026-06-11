@@ -395,6 +395,13 @@ struct SmokeNoiseConfig {
     use_sudo: bool,
 }
 
+/// Smoke gate: when `GHOSTBRO_SMOKE_OBFUSCATED=1`, run the loopback smoke with
+/// the Elligator2-uniform sealed-SPA transport (server `[spa] transport` +
+/// client `connect --transport obfuscated`) instead of the raw default (§14).
+fn smoke_obfuscated_transport() -> bool {
+    std::env::var("GHOSTBRO_SMOKE_OBFUSCATED").is_ok_and(|value| value == "1")
+}
+
 fn write_loopback_fixture(
     identity_prefix: PathBuf,
     authorized_keys: PathBuf,
@@ -444,6 +451,15 @@ fn write_loopback_fixture(
     let server_counter_state = server_config.with_extension("counters.toml");
     let _ = fs::remove_file(&server_counter_state);
 
+    // Optional Elligator2-uniform sealed-SPA transport (§14), gated like the
+    // other GHOSTBRO_SMOKE_* knobs so default smoke behavior is unchanged. The
+    // client side is driven by `--transport obfuscated` in spawn_client_listener.
+    let transport_line = if smoke_obfuscated_transport() {
+        "transport = \"obfuscated\"\n"
+    } else {
+        ""
+    };
+
     fs::write(
         &server_config,
         format!(
@@ -452,7 +468,7 @@ identity = "{}"
 
 [spa]
 mode = "udp"
-
+{transport_line}
 [spa.udp]
 port = {spa_port}
 rate_limit = 5
@@ -1048,6 +1064,11 @@ fn spawn_client_listener(
         .arg(format!("127.0.0.1:{}", config.proxy_port))
         .arg("--listen")
         .arg(format!("127.0.0.1:{socks_port}"))
+        .args(if smoke_obfuscated_transport() {
+            &["--transport", "obfuscated"][..]
+        } else {
+            &[][..]
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

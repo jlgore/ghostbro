@@ -115,6 +115,10 @@ enum Command {
         /// SPA transport mode for the authorization packet.
         #[arg(long)]
         spa_mode: Option<SpaTransport>,
+        /// Override the sealed-SPA ephemeral wire encoding (§14) for every
+        /// candidate. Defaults to the per-server config value (raw if unset).
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
         /// HTTPS SPA endpoint URL, e.g. https://example.com/api/v1/telemetry.
         #[arg(long)]
         https_spa_url: Option<String>,
@@ -576,6 +580,7 @@ fn main() -> Result<()> {
             proxy_endpoint,
             listen,
             spa_mode,
+            transport,
             https_spa_url,
             allow_ttl_seconds,
             counter_file,
@@ -586,6 +591,7 @@ fn main() -> Result<()> {
                 spa_endpoint,
                 proxy_endpoint,
                 spa_mode,
+                transport.map(SealTransport::from),
                 https_spa_url.as_deref(),
             )?;
             connect_listener(
@@ -991,12 +997,14 @@ fn revoke(config_path: &str, identity_key: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_connect_configs(
     config_path: Option<&str>,
     server_key: Option<&str>,
     spa_endpoint: Option<SocketAddr>,
     proxy_endpoint: Option<SocketAddr>,
     spa_mode_override: Option<SpaTransport>,
+    transport_override: Option<SealTransport>,
     https_spa_url_override: Option<&str>,
 ) -> Result<(Vec<ResolvedConnectConfig>, FailoverPolicy)> {
     if let Some(config_path) = config_path {
@@ -1021,7 +1029,7 @@ fn resolve_connect_configs(
                     proxy_endpoint,
                     spa_mode,
                     https_spa_url,
-                    transport: server.transport,
+                    transport: transport_override.unwrap_or(server.transport),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1042,9 +1050,9 @@ fn resolve_connect_configs(
         proxy_endpoint,
         spa_mode,
         https_spa_url: https_spa_url_override.map(str::to_owned),
-        // No-config direct connect has no enrolled transport; default to raw.
-        // (Operators wanting obfuscated connect via flags should enroll first.)
-        transport: SealTransport::Raw,
+        // No-config direct connect has no enrolled transport; honor the explicit
+        // --transport override if given, else default to raw.
+        transport: transport_override.unwrap_or(SealTransport::Raw),
     }];
     Ok((resolved, FailoverPolicy::default()))
 }
@@ -3016,6 +3024,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("resolve config");
 
@@ -3031,6 +3040,46 @@ mod tests {
         // No [failover] block => default policy.
         assert_eq!(FailoverStrategy::Priority, policy.strategy);
         assert_eq!(0, policy.max_retries);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn transport_is_taken_from_config_and_overridable() {
+        let path = temp_path("servers-transport-toml");
+        let toml = format!(
+            r#"
+            [[servers]]
+            endpoint = "127.0.0.1:8443"
+            spa_endpoint = "127.0.0.1"
+            spa_mode = "udp"
+            spa_port = 5353
+            server_public_key = "{}"
+            transport = "obfuscated"
+            "#,
+            STANDARD.encode([1u8; 32])
+        );
+        fs::write(&path, &toml).expect("write config");
+        let config_path = path.to_str().expect("utf8 path");
+
+        // The per-server `transport` is honored.
+        let (resolved, _) =
+            resolve_connect_configs(Some(config_path), None, None, None, None, None, None)
+                .expect("resolve config");
+        assert_eq!(SealTransport::Obfuscated, resolved[0].transport);
+
+        // An explicit --transport override wins over the config value.
+        let (overridden, _) = resolve_connect_configs(
+            Some(config_path),
+            None,
+            None,
+            None,
+            None,
+            Some(SealTransport::Raw),
+            None,
+        )
+        .expect("resolve config");
+        assert_eq!(SealTransport::Raw, overridden[0].transport);
+
         let _ = fs::remove_file(path);
     }
 
