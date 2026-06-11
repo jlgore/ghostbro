@@ -173,7 +173,8 @@ pub fn parse_record_header(header: &[u8; RECORD_HEADER_LEN]) -> Option<usize> {
         return None;
     }
     let body_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
-    if body_len > MAX_INNER_FRAME_LEN + TUNNEL_TAG_LEN || body_len < TUNNEL_TAG_LEN {
+    // A valid body is at least a bare tag and at most a full inner frame + tag.
+    if !(TUNNEL_TAG_LEN..=MAX_INNER_FRAME_LEN + TUNNEL_TAG_LEN).contains(&body_len) {
         return None;
     }
     Some(body_len)

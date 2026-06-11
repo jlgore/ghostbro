@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             result = decoy => result?,
             result = ebpf.run_spa(verifier, config.spa.allow_ttl_seconds(), https_spa_rx, config.clients.authorized_keys) => result?,
-            result = noise::run_proxy_listener(proxy_bind, config.server.identity, allowed_sources, relay_engine) => result?,
+            result = noise::run_proxy_listener(proxy_bind, config.server.identity, allowed_sources, relay_engine, config.spa.seal_transport()) => result?,
         }
     } else {
         let logging_config = ServerConfig::load(&cli.config).ok();

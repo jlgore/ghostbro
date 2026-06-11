@@ -69,6 +69,11 @@ use fast_socks5::{
 use ghostbro_common::{
     keys::key_id_hex,
     protocol::{PROTOCOL_GHOST_RELAY, PROTOCOL_SOCKS5},
+    seal::SealTransport,
+    tunnel::{
+        parse_record_header, server_tunnel_handshake, TunnelCipher, RECORD_HEADER_LEN,
+        REPRESENTATIVE_LEN,
+    },
 };
 use subtle::ConstantTimeEq;
 #[cfg(unix)]
@@ -85,11 +90,33 @@ const NOISE_PATTERN: &str = "Noise_XK_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME_LEN: usize = 16 * 1024;
 const NOISE_TAG_LEN: usize = 16;
 
+/// One direction of the proxy tunnel's outer framing (§5.4). `Raw` is the v0.3
+/// 2-byte-length wire format — default, byte-for-byte unchanged. `Obf` wraps each
+/// frame in a TLS-application-data-mimic record sealed by the outer obfuscation
+/// layer (§14, Phase 2); the contained [`TunnelCipher`] carries the per-direction
+/// key and record counter.
+enum OuterDir {
+    Raw,
+    Obf(TunnelCipher),
+}
+
+impl OuterDir {
+    /// Bytes of framing header to read before the body: 2 (raw BE length) or
+    /// [`RECORD_HEADER_LEN`] (the TLS-mimic record header).
+    fn header_len(&self) -> usize {
+        match self {
+            OuterDir::Raw => 2,
+            OuterDir::Obf(_) => RECORD_HEADER_LEN,
+        }
+    }
+}
+
 pub async fn run_proxy_listener(
     bind: String,
     identity_path: String,
     allowed_sources: AllowedSources,
     relay: RelayEngine,
+    transport: SealTransport,
 ) -> Result<()> {
     let static_key = load_or_generate_static_key(&identity_path)?;
     let listener = TcpListener::bind(&bind)
@@ -117,6 +144,7 @@ pub async fn run_proxy_listener(
                 allowed_sources,
                 relay,
                 sessions,
+                transport,
             )
             .await
             {
@@ -133,6 +161,7 @@ async fn handle_connection(
     allowed_sources: AllowedSources,
     relay: RelayEngine,
     sessions: SessionCounts,
+    transport: SealTransport,
 ) -> Result<()> {
     let IpAddr::V4(peer_ipv4) = peer_ip else {
         bail!("only IPv4 peers are supported in this smoke path");
@@ -159,6 +188,28 @@ async fn handle_connection(
         .build_responder()
         .context("failed to build Noise XK responder")?;
 
+    // Outer obfuscation layer (§5.4, §14). On the obfuscated transport the client
+    // sends a 32-byte Elligator2 representative first (the uniform preamble);
+    // every subsequent frame — handshake messages included — is a TLS-mimic
+    // record. On the raw transport both directions stay the v0.3 length framing.
+    let (mut outer_send, mut outer_recv) = match transport {
+        SealTransport::Raw => (OuterDir::Raw, OuterDir::Raw),
+        SealTransport::Obfuscated => {
+            let mut representative = [0u8; REPRESENTATIVE_LEN];
+            stream
+                .read_exact(&mut representative)
+                .await
+                .context("failed to read obfuscation preamble")?;
+            let static_key: [u8; 32] = static_key
+                .as_slice()
+                .try_into()
+                .context("Noise static key must be 32 bytes for the obfuscation handshake")?;
+            let tunnel = server_tunnel_handshake(&representative, &static_key)
+                .context("failed to derive obfuscated tunnel keys from preamble")?;
+            (OuterDir::Obf(tunnel.send), OuterDir::Obf(tunnel.recv))
+        }
+    };
+
     // Noise XK is a 3-message handshake: the initiator's static key arrives in
     // message 3 (encrypted under ephemeral-ephemeral agreement), so it is only
     // available — and only checkable — after we read msg3.
@@ -166,7 +217,7 @@ async fn handle_connection(
     //   msg2 (write): e, ee
     //   msg3 (read):  s, se
     let mut buf = vec![0u8; MAX_FRAME_LEN];
-    let msg1 = read_frame(&mut stream).await?;
+    let msg1 = read_frame(&mut stream, &mut outer_recv).await?;
     noise
         .read_message(&msg1, &mut buf)
         .context("failed to read Noise XK message 1")?;
@@ -174,9 +225,9 @@ async fn handle_connection(
     let len = noise
         .write_message(&[], &mut buf)
         .context("failed to write Noise XK message 2")?;
-    write_frame(&mut stream, &buf[..len]).await?;
+    write_frame(&mut stream, &mut outer_send, &buf[..len]).await?;
 
-    let msg3 = read_frame(&mut stream).await?;
+    let msg3 = read_frame(&mut stream, &mut outer_recv).await?;
     noise
         .read_message(&msg3, &mut buf)
         .context("failed to read Noise XK message 3")?;
@@ -208,10 +259,11 @@ async fn handle_connection(
         "NOISE_ACCEPT"
     );
 
-    let plaintext = read_encrypted_frame(&mut stream, &mut transport, &mut buf).await?;
+    let plaintext =
+        read_encrypted_frame(&mut stream, &mut transport, &mut outer_recv, &mut buf).await?;
     match plaintext.first().copied() {
         Some(PROTOCOL_SOCKS5) => {
-            handle_socks5(src_ip, plaintext, stream, transport).await?;
+            handle_socks5(src_ip, plaintext, stream, transport, outer_send, outer_recv).await?;
             return Ok(());
         }
         Some(PROTOCOL_GHOST_RELAY) => {
@@ -221,6 +273,7 @@ async fn handle_connection(
                 plaintext,
                 &mut stream,
                 &mut transport,
+                &mut outer_send,
                 &mut buf,
                 &relay,
             )
@@ -239,17 +292,19 @@ async fn handle_connection(
         "NOISE_FRAME_DECRYPTED"
     );
 
-    write_encrypted_frame(&mut stream, &mut transport, &plaintext, &mut buf).await?;
+    write_encrypted_frame(&mut stream, &mut transport, &mut outer_send, &plaintext, &mut buf).await?;
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ghost_relay(
     src_ip: u32,
     key_id: &[u8; 8],
     request: Vec<u8>,
     stream: &mut TcpStream,
     transport: &mut snow::TransportState,
+    outer_send: &mut OuterDir,
     buf: &mut [u8],
     relay: &RelayEngine,
 ) -> Result<()> {
@@ -260,7 +315,7 @@ async fn handle_ghost_relay(
     );
 
     let response = relay.dispatch(key_id, &request).await;
-    write_encrypted_frame(stream, transport, &response, buf).await?;
+    write_encrypted_frame(stream, transport, outer_send, &response, buf).await?;
 
     Ok(())
 }
@@ -284,8 +339,11 @@ async fn handle_socks5(
     greeting: Vec<u8>,
     stream: TcpStream,
     transport: snow::TransportState,
+    outer_send: OuterDir,
+    outer_recv: OuterDir,
 ) -> Result<()> {
-    let noise_stream = NoiseFramedStream::new(stream, transport, greeting);
+    let noise_stream =
+        NoiseFramedStream::new(stream, transport, greeting, outer_send, outer_recv);
     let proto = Socks5ServerProtocol::accept_no_auth(noise_stream)
         .await
         .context("failed SOCKS5 no-auth negotiation")?;
@@ -324,27 +382,41 @@ struct NoiseFramedStream {
     transport: snow::TransportState,
     plaintext: Vec<u8>,
     plaintext_pos: usize,
-    read_len: [u8; 2],
+    // Sized for the largest framing header (TLS-mimic record = RECORD_HEADER_LEN);
+    // the raw transport only fills the first two bytes.
+    read_len: [u8; RECORD_HEADER_LEN],
     read_len_pos: usize,
     encrypted_read: Vec<u8>,
     encrypted_read_pos: usize,
     pending_write: Vec<u8>,
     pending_write_pos: usize,
+    // Outer obfuscation framing carried over from the handshake (§5.4). The relay
+    // path is bidirectional, so this stream owns both directions' ciphers/counters.
+    outer_send: OuterDir,
+    outer_recv: OuterDir,
 }
 
 impl NoiseFramedStream {
-    fn new(stream: TcpStream, transport: snow::TransportState, initial_plaintext: Vec<u8>) -> Self {
+    fn new(
+        stream: TcpStream,
+        transport: snow::TransportState,
+        initial_plaintext: Vec<u8>,
+        outer_send: OuterDir,
+        outer_recv: OuterDir,
+    ) -> Self {
         Self {
             stream,
             transport,
             plaintext: initial_plaintext,
             plaintext_pos: 0,
-            read_len: [0; 2],
+            read_len: [0; RECORD_HEADER_LEN],
             read_len_pos: 0,
             encrypted_read: Vec::new(),
             encrypted_read_pos: 0,
             pending_write: Vec::new(),
             pending_write_pos: 0,
+            outer_send,
+            outer_recv,
         }
     }
 
@@ -357,10 +429,11 @@ impl NoiseFramedStream {
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<Option<Vec<u8>>>> {
         let this = self.get_mut();
+        let header_len = this.outer_recv.header_len();
 
-        while this.read_len_pos < this.read_len.len() {
+        while this.read_len_pos < header_len {
             let before = this.read_len_pos;
-            let mut len_buf = ReadBuf::new(&mut this.read_len[before..]);
+            let mut len_buf = ReadBuf::new(&mut this.read_len[before..header_len]);
             match Pin::new(&mut this.stream).poll_read(cx, &mut len_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -372,7 +445,7 @@ impl NoiseFramedStream {
                         }
                         return Poll::Ready(Err(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
-                            "connection closed while reading frame length",
+                            "connection closed while reading frame header",
                         )));
                     }
                     this.read_len_pos += read;
@@ -381,14 +454,36 @@ impl NoiseFramedStream {
         }
 
         if this.encrypted_read.is_empty() {
-            let frame_len = usize::from(u16::from_be_bytes(this.read_len));
-            if frame_len > MAX_FRAME_LEN {
-                return Poll::Ready(Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("frame length {frame_len} exceeds maximum {MAX_FRAME_LEN}"),
-                )));
-            }
-            this.encrypted_read.resize(frame_len, 0);
+            let body_len = match &this.outer_recv {
+                OuterDir::Raw => {
+                    let frame_len = usize::from(u16::from_be_bytes([
+                        this.read_len[0],
+                        this.read_len[1],
+                    ]));
+                    if frame_len > MAX_FRAME_LEN {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!("frame length {frame_len} exceeds maximum {MAX_FRAME_LEN}"),
+                        )));
+                    }
+                    frame_len
+                }
+                OuterDir::Obf(_) => {
+                    let header: [u8; RECORD_HEADER_LEN] = this.read_len[..RECORD_HEADER_LEN]
+                        .try_into()
+                        .expect("read_len holds RECORD_HEADER_LEN bytes");
+                    match parse_record_header(&header) {
+                        Some(body_len) => body_len,
+                        None => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "invalid obfuscated record header",
+                            )))
+                        }
+                    }
+                }
+            };
+            this.encrypted_read.resize(body_len, 0);
             this.encrypted_read_pos = 0;
         }
 
@@ -411,10 +506,22 @@ impl NoiseFramedStream {
             }
         }
 
-        let frame = std::mem::take(&mut this.encrypted_read);
+        let body = std::mem::take(&mut this.encrypted_read);
         this.encrypted_read_pos = 0;
-        this.read_len = [0; 2];
+        this.read_len = [0; RECORD_HEADER_LEN];
         this.read_len_pos = 0;
+        let frame = match &mut this.outer_recv {
+            OuterDir::Raw => body,
+            OuterDir::Obf(cipher) => match cipher.open_record(&body) {
+                Some(frame) => frame,
+                None => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "failed to open obfuscated record",
+                    )))
+                }
+            },
+        };
         Poll::Ready(Ok(Some(frame)))
     }
 
@@ -511,13 +618,27 @@ impl AsyncWrite for NoiseFramedStream {
             .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
         encrypted.truncate(encrypted_len);
 
-        let frame_len: u16 = encrypted_len
-            .try_into()
-            .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "Noise frame too large"))?;
-        self.pending_write = Vec::with_capacity(2 + encrypted_len);
-        self.pending_write
-            .extend_from_slice(&frame_len.to_be_bytes());
-        self.pending_write.extend_from_slice(&encrypted);
+        let record = match &mut self.outer_send {
+            OuterDir::Raw => {
+                let frame_len: u16 = encrypted_len.try_into().map_err(|_| {
+                    std::io::Error::new(ErrorKind::InvalidData, "Noise frame too large")
+                })?;
+                let mut record = Vec::with_capacity(2 + encrypted_len);
+                record.extend_from_slice(&frame_len.to_be_bytes());
+                record.extend_from_slice(&encrypted);
+                record
+            }
+            OuterDir::Obf(cipher) => match cipher.seal_record(&encrypted) {
+                Some(record) => record,
+                None => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "obfuscated frame exceeds maximum length",
+                    )))
+                }
+            },
+        };
+        self.pending_write = record;
         self.pending_write_pos = 0;
         tracing::info!(bytes = plaintext_len, "SOCKS5_FRAME_RELAYED");
 
@@ -664,64 +785,102 @@ fn public_key_path(path: &Path) -> std::path::PathBuf {
     }
 }
 
-async fn read_frame<R>(stream: &mut R) -> Result<Vec<u8>>
+async fn read_frame<R>(stream: &mut R, codec: &mut OuterDir) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
-    read_frame_optional(stream)
+    read_frame_optional(stream, codec)
         .await?
-        .context("connection closed while reading frame length")
+        .context("connection closed while reading frame header")
 }
 
-async fn read_frame_optional<R>(stream: &mut R) -> Result<Option<Vec<u8>>>
+async fn read_frame_optional<R>(stream: &mut R, codec: &mut OuterDir) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
-    let mut len = [0u8; 2];
-    if let Err(error) = stream.read_exact(&mut len).await {
-        if error.kind() == ErrorKind::UnexpectedEof {
-            return Ok(None);
+    match codec {
+        OuterDir::Raw => {
+            let mut len = [0u8; 2];
+            if let Err(error) = stream.read_exact(&mut len).await {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                }
+                return Err(error).context("failed to read frame length");
+            }
+            let len = usize::from(u16::from_be_bytes(len));
+            if len > MAX_FRAME_LEN {
+                bail!("frame length {len} exceeds maximum {MAX_FRAME_LEN}");
+            }
+            let mut frame = vec![0u8; len];
+            stream
+                .read_exact(&mut frame)
+                .await
+                .context("failed to read frame")?;
+            Ok(Some(frame))
         }
-        return Err(error).context("failed to read frame length");
+        OuterDir::Obf(cipher) => {
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            if let Err(error) = stream.read_exact(&mut header).await {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                }
+                return Err(error).context("failed to read obfuscated record header");
+            }
+            let body_len =
+                parse_record_header(&header).context("invalid obfuscated record header")?;
+            let mut body = vec![0u8; body_len];
+            stream
+                .read_exact(&mut body)
+                .await
+                .context("failed to read obfuscated record body")?;
+            cipher
+                .open_record(&body)
+                .context("failed to open obfuscated record")
+                .map(Some)
+        }
     }
-    let len = usize::from(u16::from_be_bytes(len));
-    if len > MAX_FRAME_LEN {
-        bail!("frame length {len} exceeds maximum {MAX_FRAME_LEN}");
-    }
-
-    let mut frame = vec![0u8; len];
-    stream
-        .read_exact(&mut frame)
-        .await
-        .context("failed to read frame")?;
-    Ok(Some(frame))
 }
 
-async fn write_frame<W>(stream: &mut W, frame: &[u8]) -> Result<()>
+async fn write_frame<W>(stream: &mut W, codec: &mut OuterDir, frame: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let len: u16 = frame
-        .len()
-        .try_into()
-        .context("frame too large for 2-byte length")?;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .context("failed to write frame length")?;
-    stream
-        .write_all(frame)
-        .await
-        .context("failed to write frame")?;
-    Ok(())
+    match codec {
+        OuterDir::Raw => {
+            let len: u16 = frame
+                .len()
+                .try_into()
+                .context("frame too large for 2-byte length")?;
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .context("failed to write frame length")?;
+            stream
+                .write_all(frame)
+                .await
+                .context("failed to write frame")?;
+            Ok(())
+        }
+        OuterDir::Obf(cipher) => {
+            let record = cipher
+                .seal_record(frame)
+                .context("obfuscated frame exceeds maximum length")?;
+            stream
+                .write_all(&record)
+                .await
+                .context("failed to write obfuscated record")?;
+            Ok(())
+        }
+    }
 }
 
 async fn read_encrypted_frame(
     stream: &mut TcpStream,
     transport: &mut snow::TransportState,
+    codec: &mut OuterDir,
     buf: &mut [u8],
 ) -> Result<Vec<u8>> {
-    let encrypted = read_frame(stream).await?;
+    let encrypted = read_frame(stream, codec).await?;
     let len = transport
         .read_message(&encrypted, buf)
         .context("failed to decrypt Noise application frame")?;
@@ -731,13 +890,14 @@ async fn read_encrypted_frame(
 async fn write_encrypted_frame(
     stream: &mut TcpStream,
     transport: &mut snow::TransportState,
+    codec: &mut OuterDir,
     plaintext: &[u8],
     buf: &mut [u8],
 ) -> Result<()> {
     let len = transport
         .write_message(plaintext, buf)
         .context("failed to encrypt Noise application frame")?;
-    write_frame(stream, &buf[..len]).await
+    write_frame(stream, codec, &buf[..len]).await
 }
 
 #[cfg(test)]
