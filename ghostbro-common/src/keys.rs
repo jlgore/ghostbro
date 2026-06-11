@@ -46,7 +46,7 @@ pub fn encode_signing_key(signing_key: &SigningKey) -> String {
 pub fn derive_noise_static_private_key(signing_key: &SigningKey) -> [u8; 32] {
     let digest = Sha256::digest(
         [
-            b"ghost-proxy client noise static v1".as_slice(),
+            b"ghostbro client noise static v1".as_slice(),
             signing_key.to_bytes().as_slice(),
         ]
         .concat(),

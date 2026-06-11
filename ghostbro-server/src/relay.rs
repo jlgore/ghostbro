@@ -43,7 +43,7 @@ pub use normalize::html_to_markdown;
 
 const RELAY_MAX_URL_LEN: usize = 2048;
 const RELAY_MAX_DOWNLOAD_CHUNK: usize = 16 * 1024 - 64;
-const DEFAULT_RELAY_SPOOL_DIR: &str = "/var/lib/ghost-proxy/relay";
+const DEFAULT_RELAY_SPOOL_DIR: &str = "/var/lib/ghostbro/relay";
 const GIT_BUNDLE_NAME: &str = "mirror.bundle";
 
 const JOB_STATUS_QUEUED: &str = "queued";
@@ -86,13 +86,13 @@ impl Default for RelayConfig {
 }
 
 impl RelayConfig {
-    /// Apply the `GHOST_PROXY_RELAY_SPOOL_DIR` / `GHOST_PROXY_RELAY_ALLOW_LOOPBACK`
+    /// Apply the `GHOSTBRO_RELAY_SPOOL_DIR` / `GHOSTBRO_RELAY_ALLOW_LOOPBACK`
     /// environment overrides on top of whatever config/defaults produced `self`.
     pub fn with_env_overrides(mut self) -> Self {
-        if let Some(dir) = std::env::var_os("GHOST_PROXY_RELAY_SPOOL_DIR") {
+        if let Some(dir) = std::env::var_os("GHOSTBRO_RELAY_SPOOL_DIR") {
             self.spool_dir = PathBuf::from(dir);
         }
-        if std::env::var_os("GHOST_PROXY_RELAY_ALLOW_LOOPBACK").is_some() {
+        if std::env::var_os("GHOSTBRO_RELAY_ALLOW_LOOPBACK").is_some() {
             self.allow_loopback = true;
         }
         self

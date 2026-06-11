@@ -65,8 +65,10 @@ pub struct SpaUdpSection {
 pub struct SpaHttpsSection {
     pub path: String,
     pub response_status: Option<u16>,
-    #[serde(default)]
-    pub trust_forwarded_for: bool,
+    /// Reverse-proxy addresses whose `X-Forwarded-For` is trusted. A non-empty
+    /// list IS the trust grant (v0.3 dropped the redundant boolean): XFF is
+    /// honored only for TCP peers inside one of these CIDRs, else the TCP peer
+    /// address is authoritative. nginx mode requires this to be set.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
 }
@@ -165,13 +167,6 @@ impl SpaSection {
             .unwrap_or(204)
     }
 
-    pub fn trust_forwarded_for(&self) -> bool {
-        self.https
-            .as_ref()
-            .map(|https| https.trust_forwarded_for)
-            .unwrap_or(false)
-    }
-
     pub fn trusted_proxy_cidrs(&self) -> &[String] {
         self.https
             .as_ref()
@@ -227,7 +222,7 @@ fn default_counter_state() -> String {
     DEFAULT_COUNTER_STATE.to_owned()
 }
 
-const DEFAULT_COUNTER_STATE: &str = "/var/lib/ghost-proxy/spa-counters.toml";
+const DEFAULT_COUNTER_STATE: &str = "/var/lib/ghostbro/spa-counters.toml";
 
 #[cfg(test)]
 mod tests {
@@ -238,7 +233,7 @@ mod tests {
         let config: ServerConfig = toml::from_str(
             r#"
             [server]
-            identity = "/etc/ghost-proxy/server.key"
+            identity = "/etc/ghostbro/server.key"
 
             [spa]
             mode = "udp"
@@ -253,11 +248,11 @@ mod tests {
 
             [proxy]
             port = 8443
-            noise_pattern = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+            noise_pattern = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
             bind = "0.0.0.0"
 
             [clients]
-            authorized_keys = "/etc/ghost-proxy/authorized_keys.toml"
+            authorized_keys = "/etc/ghostbro/authorized_keys.toml"
 
             [decoy]
             mode = "builtin"
@@ -284,7 +279,7 @@ mod tests {
         let config: ServerConfig = toml::from_str(
             r#"
             [server]
-            identity = "/etc/ghost-proxy/server.key"
+            identity = "/etc/ghostbro/server.key"
 
             [spa]
             mode = "https"
@@ -292,22 +287,20 @@ mod tests {
             [spa.https]
             path = "/api/v1/telemetry"
             response_status = 200
-            trust_forwarded_for = true
             trusted_proxy_cidrs = ["127.0.0.1/32"]
 
             [proxy]
             port = 8443
-            noise_pattern = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+            noise_pattern = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
             bind = "0.0.0.0"
 
             [clients]
-            authorized_keys = "/etc/ghost-proxy/authorized_keys.toml"
+            authorized_keys = "/etc/ghostbro/authorized_keys.toml"
             "#,
         )
         .expect("valid config");
 
         assert_eq!(200, config.spa.https_response_status());
-        assert!(config.spa.trust_forwarded_for());
         assert_eq!(
             &["127.0.0.1/32".to_owned()],
             config.spa.trusted_proxy_cidrs()

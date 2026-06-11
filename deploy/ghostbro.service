@@ -2,17 +2,17 @@
 #
 # This realizes the "proxy runs as an unprivileged user; only the eBPF loader
 # needs CAP_BPF / CAP_NET_ADMIN" requirement: the daemon never runs as root.
-# systemd starts it as the `ghost-proxy` user with exactly the ambient
+# systemd starts it as the `ghostbro` user with exactly the ambient
 # capabilities the eBPF loader and the :443 decoy bind require, and nothing else.
 #
 # Setup:
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ghost-proxy
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ghostbro
 #   sudo install -Dm755 target/release/ghostbro-server /usr/local/bin/ghostbro-server
 #   sudo install -Dm644 target/bpfel-unknown-none/release/ghostbro-ebpf \
-#       /usr/local/lib/ghost-proxy/ghostbro-ebpf
-#   # /var/lib/ghost-proxy (relay spool, counters) and /var/log/ghost-proxy are
+#       /usr/local/lib/ghostbro/ghostbro-ebpf
+#   # /var/lib/ghostbro (relay spool, counters) and /var/log/ghostbro are
 #   # created and owned by the service user via StateDirectory/LogsDirectory below.
-#   sudo systemctl daemon-reload && sudo systemctl enable --now ghost-proxy
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ghostbro
 
 [Unit]
 Description=Ghostbro server (SPA + Noise IK proxy + eBPF XDP)
@@ -22,15 +22,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ghostbro-server \
-    --config /etc/ghost-proxy/ghost-proxy.toml \
+    --config /etc/ghostbro/ghostbro.toml \
     --iface eth0 \
-    --ebpf-object /usr/local/lib/ghost-proxy/ghostbro-ebpf
+    --ebpf-object /usr/local/lib/ghostbro/ghostbro-ebpf
 Restart=on-failure
 RestartSec=5
 
 # --- Run unprivileged with only the capabilities the loader needs ---
-User=ghost-proxy
-Group=ghost-proxy
+User=ghostbro
+Group=ghostbro
 # CAP_BPF: load/attach XDP + read/write BPF maps (allow-map, ring buffer).
 # CAP_NET_ADMIN: attach the XDP program to the interface via netlink.
 # CAP_NET_BIND_SERVICE: bind the builtin decoy on :443 (drop if decoy >1024 or behind nginx).
@@ -39,9 +39,9 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 
 # --- Writable state, everything else read-only ---
-StateDirectory=ghost-proxy
-LogsDirectory=ghost-proxy
-ReadWritePaths=/var/lib/ghost-proxy /var/log/ghost-proxy
+StateDirectory=ghostbro
+LogsDirectory=ghostbro
+ReadWritePaths=/var/lib/ghostbro /var/log/ghostbro
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

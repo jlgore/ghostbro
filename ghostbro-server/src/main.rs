@@ -27,7 +27,7 @@ mod spa;
 #[command(about = "Ghostbro server daemon")]
 struct Cli {
     /// Server configuration path.
-    #[arg(long, default_value = "/etc/ghost-proxy/ghost-proxy.toml")]
+    #[arg(long, default_value = "/etc/ghostbro/ghostbro.toml")]
     config: String,
 
     /// Network interface for XDP attachment. Defaults to loopback for local testing.
@@ -64,7 +64,6 @@ async fn main() -> Result<()> {
             https_spa_tx,
             config.spa.https_path(),
             config.spa.https_response_status(),
-            config.spa.trust_forwarded_for(),
             config.spa.trusted_proxy_cidrs(),
             config
                 .decoy
@@ -76,18 +75,19 @@ async fn main() -> Result<()> {
 
         let authorized_keys = AuthorizedKeysFile::load(&config.clients.authorized_keys)?;
         let clients = authorized_keys.into_clients()?;
-        // Bind this node's Noise static identity into SPA verification so a SPA
-        // accepted here cannot be replayed against another node (F-003).
-        let server_static_pubkey = noise::load_static_public_key(&config.server.identity)?;
+        // The server's Noise static private key opens sealed SPA payloads and
+        // binds this node's identity into SPA verification, so a SPA accepted
+        // here cannot be replayed against another node (F-003).
+        let server_static_private = noise::load_static_private_key(&config.server.identity)?;
         // Fail closed on a missing counter-state file unless explicitly
         // initialising a fresh deployment (F-007).
         let allow_missing_counter_state =
-            std::env::var_os("GHOST_PROXY_SPA_COUNTER_INIT").is_some();
+            std::env::var_os("GHOSTBRO_SPA_COUNTER_INIT").is_some();
         let verifier = spa::SpaVerifier::load(
             clients,
             config.spa.time_window_seconds(),
             config.spa.counter_state_path(),
-            server_static_pubkey,
+            server_static_private,
             allow_missing_counter_state,
         )?;
         let allowed_sources = Arc::new(RwLock::new(HashMap::new()));
@@ -123,7 +123,6 @@ async fn main() -> Result<()> {
             None,
             "/api/v1/telemetry",
             204,
-            false,
             &[],
             logging_config
                 .as_ref()

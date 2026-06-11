@@ -3,7 +3,7 @@
 //! Ghostbro's eBPF loader needs `CAP_BPF` + `CAP_NET_ADMIN` (and
 //! `CAP_NET_BIND_SERVICE` to bind the builtin decoy on :443). The recommended
 //! deployment runs the daemon as an **unprivileged user** with exactly those
-//! ambient capabilities via the systemd unit in `deploy/ghost-proxy.service`,
+//! ambient capabilities via the systemd unit in `deploy/ghostbro.service`,
 //! rather than as root.
 //!
 //! This module deliberately does **not** perform an in-process root→user drop.
@@ -65,7 +65,7 @@ pub fn log_startup_privileges() {
     if status.is_root {
         tracing::warn!(
             "running as root (uid 0); for production run unprivileged via \
-             deploy/ghost-proxy.service (User= + AmbientCapabilities=CAP_BPF \
+             deploy/ghostbro.service (User= + AmbientCapabilities=CAP_BPF \
              CAP_NET_ADMIN CAP_NET_BIND_SERVICE) so only the eBPF loader holds capabilities"
         );
     } else {

@@ -1,12 +1,64 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{ErrorKind, IoSlice},
     net::IpAddr,
     path::Path,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
+
+use ghostbro_common::keys::KeyId;
+
+/// Live concurrent-session counts per client `key_id`, used to enforce
+/// `max_concurrent_sessions` (§9) at the proxy tunnel layer — the point where
+/// the client identity is known (via the Noise static-key binding).
+type SessionCounts = Arc<Mutex<HashMap<KeyId, u32>>>;
+
+/// RAII slot: increments the per-key session count on acquire, decrements on
+/// drop (connection close).
+struct SessionSlot {
+    sessions: SessionCounts,
+    key_id: KeyId,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .sessions
+            .lock()
+            .expect("session counts lock poisoned");
+        if let Some(count) = counts.get_mut(&self.key_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key_id);
+            }
+        }
+    }
+}
+
+/// Try to reserve a session slot for `key_id`. Returns `None` if the client is
+/// already at its configured limit. A limit of `None` or `0` means unlimited.
+fn acquire_session(
+    sessions: &SessionCounts,
+    key_id: KeyId,
+    max: Option<u16>,
+) -> Option<SessionSlot> {
+    let mut counts = sessions.lock().expect("session counts lock poisoned");
+    let count = counts.entry(key_id).or_insert(0);
+    if let Some(max) = max {
+        if max > 0 && *count >= u32::from(max) {
+            return None;
+        }
+    }
+    *count += 1;
+    Some(SessionSlot {
+        sessions: sessions.clone(),
+        key_id,
+    })
+}
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -29,7 +81,7 @@ use tokio::{
 use crate::ebpf::{format_ipv4, monotonic_now_ns, AllowedSources};
 use crate::relay::RelayEngine;
 
-const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+const NOISE_PATTERN: &str = "Noise_XK_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME_LEN: usize = 16 * 1024;
 const NOISE_TAG_LEN: usize = 16;
 
@@ -45,6 +97,8 @@ pub async fn run_proxy_listener(
         .with_context(|| format!("failed to bind Noise TCP proxy on {bind}"))?;
     tracing::info!(bind, identity_path, "started Noise TCP proxy listener");
 
+    let sessions: SessionCounts = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         let (stream, peer_addr) = listener
             .accept()
@@ -53,10 +107,18 @@ pub async fn run_proxy_listener(
         let static_key = static_key.clone();
         let allowed_sources = allowed_sources.clone();
         let relay = relay.clone();
+        let sessions = sessions.clone();
 
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_connection(stream, peer_addr.ip(), static_key, allowed_sources, relay).await
+            if let Err(error) = handle_connection(
+                stream,
+                peer_addr.ip(),
+                static_key,
+                allowed_sources,
+                relay,
+                sessions,
+            )
+            .await
             {
                 tracing::warn!(?error, src_ip = %peer_addr.ip(), "NOISE_REJECT");
             }
@@ -70,6 +132,7 @@ async fn handle_connection(
     static_key: Vec<u8>,
     allowed_sources: AllowedSources,
     relay: RelayEngine,
+    sessions: SessionCounts,
 ) -> Result<()> {
     let IpAddr::V4(peer_ipv4) = peer_ip else {
         bail!("only IPv4 peers are supported in this smoke path");
@@ -94,19 +157,47 @@ async fn handle_connection(
         .local_private_key(&static_key)
         .prologue(&source.entry.key_id)
         .build_responder()
-        .context("failed to build Noise IK responder")?;
+        .context("failed to build Noise XK responder")?;
 
-    let msg1 = read_frame(&mut stream).await?;
+    // Noise XK is a 3-message handshake: the initiator's static key arrives in
+    // message 3 (encrypted under ephemeral-ephemeral agreement), so it is only
+    // available — and only checkable — after we read msg3.
+    //   msg1 (read):  e
+    //   msg2 (write): e, ee
+    //   msg3 (read):  s, se
     let mut buf = vec![0u8; MAX_FRAME_LEN];
+    let msg1 = read_frame(&mut stream).await?;
     noise
         .read_message(&msg1, &mut buf)
-        .context("failed to read Noise IK message 1")?;
-    verify_client_noise_static(noise.get_remote_static(), &source.noise_public_key)?;
+        .context("failed to read Noise XK message 1")?;
 
     let len = noise
         .write_message(&[], &mut buf)
-        .context("failed to write Noise IK message 2")?;
+        .context("failed to write Noise XK message 2")?;
     write_frame(&mut stream, &buf[..len]).await?;
+
+    let msg3 = read_frame(&mut stream).await?;
+    noise
+        .read_message(&msg3, &mut buf)
+        .context("failed to read Noise XK message 3")?;
+    verify_client_noise_static(noise.get_remote_static(), &source.noise_public_key)?;
+
+    // Identity is now confirmed (the initiator static matched the SPA-authorized
+    // key). Reserve a concurrent-session slot keyed on key_id; the guard releases
+    // it when this connection ends. Acquiring after the static check prevents an
+    // allowed-IP co-tenant who cannot complete the handshake from consuming slots.
+    let _session = acquire_session(
+        &sessions,
+        source.entry.key_id,
+        source.max_concurrent_sessions,
+    )
+    .ok_or_else(|| {
+        tracing::warn!(
+            key_id = %key_id_hex(&source.entry.key_id),
+            "SESSION_LIMIT"
+        );
+        anyhow::anyhow!("client at max_concurrent_sessions limit")
+    })?;
 
     let mut transport = noise
         .into_transport_mode()
@@ -176,7 +267,7 @@ async fn handle_ghost_relay(
 
 fn verify_client_noise_static(remote_static: Option<&[u8]>, expected: &[u8; 32]) -> Result<()> {
     let remote_static =
-        remote_static.context("Noise IK message 1 did not include an initiator static key")?;
+        remote_static.context("Noise XK message 3 did not include an initiator static key")?;
     // Constant-time comparison to avoid leaking how many leading bytes of the
     // SPA-authorized identity key matched. The length guard ensures ct_eq
     // operates over two equal-length 32-byte slices.
@@ -491,11 +582,11 @@ fn load_or_generate_static_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
             Ok(key)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if std::env::var_os("GHOST_PROXY_GENERATE_IDENTITY").is_none() {
+            if std::env::var_os("GHOSTBRO_GENERATE_IDENTITY").is_none() {
                 bail!(
                     "Noise static identity file {} not found; refusing to mint a new pinned \
                      identity on the serving path. Provision the identity out of band, or set \
-                     GHOST_PROXY_GENERATE_IDENTITY=1 to opt into auto-generation (provisioning \
+                     GHOSTBRO_GENERATE_IDENTITY=1 to opt into auto-generation (provisioning \
                      and smoke tests only).",
                     path.display()
                 );
@@ -526,14 +617,19 @@ fn load_or_generate_static_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
 /// file. Used to bind the server's identity into SPA verification so a SPA
 /// accepted by one node does not verify on another (F-003).
 pub fn load_static_public_key(path: impl AsRef<Path>) -> Result<[u8; 32]> {
-    let private = load_or_generate_static_key(path)?;
-    let private: [u8; 32] = private
+    Ok(ghostbro_common::keys::derive_noise_public_from_private(
+        &load_static_private_key(path)?,
+    ))
+}
+
+/// Load this server's Noise static *private* key (32 bytes) from its identity
+/// file. The SPA verifier needs it to open sealed SPA payloads (§4.3); it is the
+/// same key used for the Noise XK handshake.
+pub fn load_static_private_key(path: impl AsRef<Path>) -> Result<[u8; 32]> {
+    load_or_generate_static_key(path)?
         .as_slice()
         .try_into()
-        .context("Noise static private key must be 32 bytes")?;
-    Ok(ghostbro_common::keys::derive_noise_public_from_private(
-        &private,
-    ))
+        .context("Noise static private key must be 32 bytes")
 }
 
 fn write_private_key_file(

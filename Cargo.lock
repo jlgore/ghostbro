@@ -939,6 +939,7 @@ name = "ghostbro-common"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "chacha20poly1305",
  "ed25519-dalek",
  "rand 0.8.6",
  "serde",

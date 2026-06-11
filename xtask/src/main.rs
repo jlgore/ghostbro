@@ -52,7 +52,7 @@ enum XtaskCommand {
         #[arg(long, default_value = "127.0.0.1:8080")]
         decoy_bind: String,
     },
-    /// Run the local UDP SPA + Noise IK TCP smoke test.
+    /// Run the local UDP SPA + Noise XK TCP smoke test.
     SmokeNoiseLoopback {
         /// Output prefix for generated debug identity files.
         #[arg(long, default_value = "/tmp/ghost-smoke-debug")]
@@ -85,7 +85,7 @@ enum XtaskCommand {
         #[arg(long)]
         no_sudo: bool,
     },
-    /// Run the local UDP SPA + Noise IK + SOCKS5 CONNECT smoke test.
+    /// Run the local UDP SPA + Noise XK + SOCKS5 CONNECT smoke test.
     SmokeSocks5Loopback {
         /// Output prefix for generated debug identity files.
         #[arg(long, default_value = "/tmp/ghost-socks5-debug")]
@@ -160,7 +160,7 @@ enum XtaskCommand {
         #[arg(long)]
         no_sudo: bool,
     },
-    /// Run the local UDP SPA + Noise IK + Ghost Relay content smoke test.
+    /// Run the local UDP SPA + Noise XK + Ghost Relay content smoke test.
     SmokeGhostRelayLoopback {
         /// Output prefix for generated debug identity files.
         #[arg(long, default_value = "/tmp/ghost-relay-debug")]
@@ -438,6 +438,12 @@ fn write_loopback_fixture(
     )
     .with_context(|| format!("failed to write {}", authorized_keys.display()))?;
 
+    // Keep the server SPA counter-state file inside the throwaway fixture (not
+    // the production /var/lib/ghostbro default), so the smoke run is self-
+    // contained and the first-run init below is the only place it is seeded.
+    let server_counter_state = server_config.with_extension("counters.toml");
+    let _ = fs::remove_file(&server_counter_state);
+
     fs::write(
         &server_config,
         format!(
@@ -454,16 +460,18 @@ rate_limit = 5
 [spa.common]
 time_window = 300
 allow_ttl = 14400
+counter_state = "{}"
 
 [proxy]
 port = {proxy_port}
-noise_pattern = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+noise_pattern = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
 bind = "0.0.0.0"
 
 [clients]
 authorized_keys = "{}"
 "#,
             server_noise_key.display(),
+            server_counter_state.display(),
             authorized_keys.display()
         ),
     )
@@ -719,15 +727,19 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
             "--",
             "env",
             "RUST_LOG=debug",
-            "GHOST_PROXY_DISABLE_AUTH_WATCH=1",
-            "GHOST_PROXY_RELAY_ALLOW_LOOPBACK=1",
+            "GHOSTBRO_DISABLE_AUTH_WATCH=1",
+            "GHOSTBRO_RELAY_ALLOW_LOOPBACK=1",
             // The fixture deletes the server Noise key and relies on the server
             // minting one at startup; opt into auto-generation explicitly since
             // the serving path now fails closed on a missing identity (F-001).
-            "GHOST_PROXY_GENERATE_IDENTITY=1",
+            "GHOSTBRO_GENERATE_IDENTITY=1",
+            // First-run init: the fixture uses a fresh counter-state file, so opt
+            // into seeding it since SPA verification fails closed on a missing
+            // counter-state file (F-007).
+            "GHOSTBRO_SPA_COUNTER_INIT=1",
         ]);
         command.arg(format!(
-            "GHOST_PROXY_RELAY_SPOOL_DIR={}-relay-spool",
+            "GHOSTBRO_RELAY_SPOOL_DIR={}-relay-spool",
             config.identity_prefix.display()
         ));
         command.arg("./target/debug/ghostbro-server");
@@ -735,15 +747,18 @@ fn spawn_server(config: &SmokeNoiseConfig, fixture: &LoopbackFixture) -> Result<
     } else {
         let mut command = Command::new("./target/debug/ghostbro-server");
         command.env("RUST_LOG", "debug");
-        command.env("GHOST_PROXY_DISABLE_AUTH_WATCH", "1");
+        command.env("GHOSTBRO_DISABLE_AUTH_WATCH", "1");
         command
     };
-    command.env("GHOST_PROXY_RELAY_ALLOW_LOOPBACK", "1");
+    command.env("GHOSTBRO_RELAY_ALLOW_LOOPBACK", "1");
     // Smoke fixture deletes the server Noise key; opt into regeneration so the
     // fail-closed serving path (F-001) does not abort the loopback smoke run.
-    command.env("GHOST_PROXY_GENERATE_IDENTITY", "1");
+    command.env("GHOSTBRO_GENERATE_IDENTITY", "1");
+    // Fresh counter-state file each run; opt into first-run seeding so the
+    // fail-closed SPA verifier (F-007) does not abort the smoke run.
+    command.env("GHOSTBRO_SPA_COUNTER_INIT", "1");
     command.env(
-        "GHOST_PROXY_RELAY_SPOOL_DIR",
+        "GHOSTBRO_RELAY_SPOOL_DIR",
         format!("{}-relay-spool", config.identity_prefix.display()),
     );
 

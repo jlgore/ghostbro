@@ -4,9 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::net::Ipv4Addr;
+
 use anyhow::Context;
 use ghostbro_common::{
     keys::{key_id_from_hex, key_id_hex, KeyId},
+    seal::x25519_public_from_private,
     spa::{SpaError, SpaMode, SpaPacket},
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +23,9 @@ pub struct SpaVerifier {
     highest_counters: HashMap<KeyId, u64>,
     time_window_ms: u64,
     counter_state_path: Option<PathBuf>,
+    /// Server Noise static private key — opens the sealed SPA payload (§4.3).
+    server_static_private: [u8; 32],
+    /// Derived public half, bound into the inner SPA signature.
     server_static_pubkey: [u8; 32],
 }
 
@@ -36,6 +42,8 @@ pub struct SpaAccept {
     pub noise_public_key: [u8; 32],
     pub mode: SpaMode,
     pub counter: u64,
+    /// Per-client concurrent-session cap, enforced at the proxy tunnel layer.
+    pub max_concurrent_sessions: Option<u16>,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +56,8 @@ pub enum SpaVerifyError {
     UnauthorizedTier(String),
     #[error("timestamp outside configured window")]
     TimestampOutsideWindow,
+    #[error("source IP does not match the address bound in the SPA")]
+    SourceIpMismatch,
     #[error("replayed or stale counter")]
     ReplayedCounter,
     #[error("failed to persist SPA counter state: {0}")]
@@ -58,14 +68,14 @@ impl SpaVerifier {
     pub fn new(
         clients: Vec<AuthorizedClient>,
         time_window_seconds: u64,
-        server_static_pubkey: [u8; 32],
+        server_static_private: [u8; 32],
     ) -> Self {
         Self::from_counters(
             clients,
             time_window_seconds,
             HashMap::new(),
             None,
-            server_static_pubkey,
+            server_static_private,
         )
     }
 
@@ -81,7 +91,7 @@ impl SpaVerifier {
         clients: Vec<AuthorizedClient>,
         time_window_seconds: u64,
         counter_state_path: impl AsRef<Path>,
-        server_static_pubkey: [u8; 32],
+        server_static_private: [u8; 32],
         allow_missing_state: bool,
     ) -> anyhow::Result<Self> {
         let path = counter_state_path.as_ref().to_path_buf();
@@ -91,7 +101,7 @@ impl SpaVerifier {
             time_window_seconds,
             highest_counters,
             Some(path),
-            server_static_pubkey,
+            server_static_private,
         ))
     }
 
@@ -100,7 +110,7 @@ impl SpaVerifier {
         time_window_seconds: u64,
         highest_counters: HashMap<KeyId, u64>,
         counter_state_path: Option<PathBuf>,
-        server_static_pubkey: [u8; 32],
+        server_static_private: [u8; 32],
     ) -> Self {
         let clients = clients
             .into_iter()
@@ -112,7 +122,8 @@ impl SpaVerifier {
             highest_counters,
             time_window_ms: time_window_seconds.saturating_mul(1_000),
             counter_state_path,
-            server_static_pubkey,
+            server_static_pubkey: x25519_public_from_private(&server_static_private),
+            server_static_private,
         }
     }
 
@@ -129,8 +140,15 @@ impl SpaVerifier {
             .collect()
     }
 
-    pub fn verify(&mut self, payload: &[u8], now_ms: u64) -> Result<SpaAccept, SpaVerifyError> {
-        let packet = SpaPacket::parse(payload)?;
+    pub fn verify(
+        &mut self,
+        payload: &[u8],
+        observed_src_ip: Ipv4Addr,
+        now_ms: u64,
+    ) -> Result<SpaAccept, SpaVerifyError> {
+        // Open the seal first: nothing inside (including key_id) is readable
+        // without the server static private key.
+        let packet = SpaPacket::open(payload, &self.server_static_private)?;
         let Some(client) = self.clients.get(&packet.key_id) else {
             return Err(SpaVerifyError::UnknownKey(key_id_hex(&packet.key_id)));
         };
@@ -138,7 +156,7 @@ impl SpaVerifier {
         // Verify the signature before any authorization decision so the tier
         // branch (and its distinguishable error) is unreachable without a valid
         // signature — closes the unauthenticated key/tier enumeration oracle.
-        packet.verify(payload, &client.public_key, &self.server_static_pubkey)?;
+        packet.verify(&client.public_key, &self.server_static_pubkey)?;
 
         if client.tier != ClientTier::Full {
             return Err(SpaVerifyError::UnauthorizedTier(client.name.clone()));
@@ -147,6 +165,13 @@ impl SpaVerifier {
         let drift = now_ms.abs_diff(packet.timestamp_ms);
         if drift > self.time_window_ms {
             return Err(SpaVerifyError::TimestampOutsideWindow);
+        }
+
+        // Source-IP binding (§4.6): unless the client opted into the CGNAT escape
+        // hatch, the observed source must equal the signed allow_ip. This defeats
+        // an on-path attacker replaying a captured SPA from a different address.
+        if !packet.use_packet_source && packet.allow_ip != observed_src_ip {
+            return Err(SpaVerifyError::SourceIpMismatch);
         }
 
         let highest_counter = self
@@ -158,6 +183,9 @@ impl SpaVerifier {
             return Err(SpaVerifyError::ReplayedCounter);
         }
 
+        // Persist the new high-water mark BEFORE returning accept (write-then-
+        // accept): a crash after this point can never accept a counter it has
+        // not durably recorded.
         self.highest_counters.insert(packet.key_id, packet.counter);
         self.persist_counters()?;
 
@@ -168,6 +196,7 @@ impl SpaVerifier {
             noise_public_key: client.noise_public_key,
             mode: packet.mode,
             counter: packet.counter,
+            max_concurrent_sessions: client.max_concurrent_sessions,
         })
     }
 
@@ -192,7 +221,7 @@ fn load_counter_state(
             }
             return Err(anyhow::anyhow!(
                 "SPA counter-state file {} is missing; refusing to start with reset replay \
-                 counters. Set GHOST_PROXY_SPA_COUNTER_INIT=1 for an explicit first-run init.",
+                 counters. Set GHOSTBRO_SPA_COUNTER_INIT=1 for an explicit first-run init.",
                 path.display()
             ));
         }
@@ -227,9 +256,19 @@ fn save_counter_state(path: &Path, counters: &HashMap<KeyId, u64>) -> anyhow::Re
             .map_err(|error| anyhow::anyhow!("failed to create {}: {error}", parent.display()))?;
     }
 
+    // Write to a temp file, fsync it durable, then atomically rename over the
+    // live file. fsync-before-rename guarantees the high-water counter is on disk
+    // before it is observable, so a crash cannot resurrect a replay window.
     let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, contents)
-        .map_err(|error| anyhow::anyhow!("failed to write {}: {error}", temp_path.display()))?;
+    {
+        let mut file = fs::File::create(&temp_path)
+            .map_err(|error| anyhow::anyhow!("failed to create {}: {error}", temp_path.display()))?;
+        use std::io::Write as _;
+        file.write_all(contents.as_bytes())
+            .map_err(|error| anyhow::anyhow!("failed to write {}: {error}", temp_path.display()))?;
+        file.sync_all()
+            .map_err(|error| anyhow::anyhow!("failed to fsync {}: {error}", temp_path.display()))?;
+    }
     fs::rename(&temp_path, path).map_err(|error| {
         anyhow::anyhow!(
             "failed to rename {} to {}: {error}",
@@ -242,21 +281,36 @@ fn save_counter_state(path: &Path, counters: &HashMap<KeyId, u64>) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{SigningKey, VerifyingKey};
     use ghostbro_common::{
         keys::{derive_noise_static_public_key, generate_ed25519_keypair},
-        spa::SpaPacket,
+        seal::x25519_public_from_private,
+        spa::{SpaAllowIp, SpaPacket},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
-    const TEST_SERVER_PUBKEY: [u8; 32] = [0x5au8; 32];
+    const TEST_SERVER_PRIV: [u8; 32] = [0x5au8; 32];
+    const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+
+    fn test_server_pub() -> [u8; 32] {
+        x25519_public_from_private(&TEST_SERVER_PRIV)
+    }
 
     fn client_from_key(name: &str, signing_key: &SigningKey) -> AuthorizedClient {
-        let public_key = signing_key.verifying_key();
-        let key_id = ghostbro_common::keys::key_id_for_public_key(&public_key);
+        client_with_public_key(name, signing_key, signing_key.verifying_key())
+    }
 
+    /// Build an authorized client whose `key_id` comes from `signing_key` but
+    /// whose enrolled `public_key` can be overridden — used to drive a key_id
+    /// match with a signature mismatch.
+    fn client_with_public_key(
+        name: &str,
+        signing_key: &SigningKey,
+        public_key: VerifyingKey,
+    ) -> AuthorizedClient {
+        let key_id = ghostbro_common::keys::key_id_for_public_key(&signing_key.verifying_key());
         AuthorizedClient {
             name: name.to_owned(),
             public_key,
@@ -268,15 +322,31 @@ mod tests {
         }
     }
 
+    /// Build a sealed SPA bound to an explicit source IP.
+    fn build_spa(
+        signing_key: &SigningKey,
+        mode: SpaMode,
+        timestamp_ms: u64,
+        counter: u64,
+    ) -> Vec<u8> {
+        SpaPacket::build(
+            signing_key,
+            mode,
+            timestamp_ms,
+            counter,
+            SpaAllowIp::Explicit(CLIENT_IP),
+            &test_server_pub(),
+        )
+    }
+
     #[test]
     fn accepts_valid_spa_once() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("jared-laptop", &signing_key);
-        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PUBKEY);
-        let payload =
-            SpaPacket::build(&signing_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PRIV);
+        let payload = build_spa(&signing_key, SpaMode::Udp, 1_000_000, 1);
 
-        let accepted = verifier.verify(&payload, 1_000_001).expect("accepted");
+        let accepted = verifier.verify(&payload, CLIENT_IP, 1_000_001).expect("accepted");
 
         assert_eq!("jared-laptop", accepted.client_name);
         assert_eq!(SpaMode::Udp, accepted.mode);
@@ -287,14 +357,13 @@ mod tests {
     fn rejects_replayed_counter() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("friend-phone", &signing_key);
-        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PUBKEY);
-        let payload =
-            SpaPacket::build(&signing_key, SpaMode::Https, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PRIV);
+        let payload = build_spa(&signing_key, SpaMode::Https, 1_000_000, 1);
 
-        verifier.verify(&payload, 1_000_001).expect("first use");
+        verifier.verify(&payload, CLIENT_IP, 1_000_001).expect("first use");
 
         assert!(matches!(
-            verifier.verify(&payload, 1_000_002),
+            verifier.verify(&payload, CLIENT_IP, 1_000_002),
             Err(SpaVerifyError::ReplayedCounter)
         ));
     }
@@ -303,14 +372,46 @@ mod tests {
     fn rejects_timestamp_outside_window() {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("friend-phone", &signing_key);
-        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PUBKEY);
-        let payload =
-            SpaPacket::build(&signing_key, SpaMode::Https, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PRIV);
+        let payload = build_spa(&signing_key, SpaMode::Https, 1_000_000, 1);
 
         assert!(matches!(
-            verifier.verify(&payload, 1_301_000),
+            verifier.verify(&payload, CLIENT_IP, 1_301_000),
             Err(SpaVerifyError::TimestampOutsideWindow)
         ));
+    }
+
+    #[test]
+    fn rejects_source_ip_mismatch_but_accepts_packet_source() {
+        // Explicit allow_ip: a packet replayed from a different source is rejected.
+        let signing_key = generate_ed25519_keypair();
+        let client = client_from_key("jared-laptop", &signing_key);
+        let mut verifier = SpaVerifier::new(vec![client.clone()], 300, TEST_SERVER_PRIV);
+        let payload = build_spa(&signing_key, SpaMode::Udp, 1_000_000, 1);
+
+        let attacker_ip = Ipv4Addr::new(198, 51, 100, 9);
+        assert!(matches!(
+            verifier.verify(&payload, attacker_ip, 1_000_001),
+            Err(SpaVerifyError::SourceIpMismatch)
+        ));
+        // From the bound address it is accepted.
+        verifier
+            .verify(&payload, CLIENT_IP, 1_000_002)
+            .expect("accepted from the bound source IP");
+
+        // CGNAT escape hatch: PacketSource accepts whatever address is observed.
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PRIV);
+        let any_source = SpaPacket::build(
+            &signing_key,
+            SpaMode::Udp,
+            1_000_000,
+            1,
+            SpaAllowIp::PacketSource,
+            &test_server_pub(),
+        );
+        verifier
+            .verify(&any_source, attacker_ip, 1_000_001)
+            .expect("packet-source mode accepts the observed IP");
     }
 
     #[test]
@@ -320,8 +421,7 @@ mod tests {
         let client = client_from_key("friend-phone", &signing_key);
         let state_path = temp_counter_state_path();
 
-        let result =
-            SpaVerifier::load(vec![client], 300, &state_path, TEST_SERVER_PUBKEY, false);
+        let result = SpaVerifier::load(vec![client], 300, &state_path, TEST_SERVER_PRIV, false);
 
         assert!(
             result.is_err(),
@@ -335,19 +435,18 @@ mod tests {
         let signing_key = generate_ed25519_keypair();
         let client = client_from_key("friend-phone", &signing_key);
         let state_path = temp_counter_state_path();
-        let payload =
-            SpaPacket::build(&signing_key, SpaMode::Udp, 1_000_000, 7, &TEST_SERVER_PUBKEY);
+        let payload = build_spa(&signing_key, SpaMode::Udp, 1_000_000, 7);
 
         let mut verifier =
-            SpaVerifier::load(vec![client.clone()], 300, &state_path, TEST_SERVER_PUBKEY, true)
+            SpaVerifier::load(vec![client.clone()], 300, &state_path, TEST_SERVER_PRIV, true)
                 .expect("verifier loads missing state on explicit init");
-        verifier.verify(&payload, 1_000_001).expect("accepted");
+        verifier.verify(&payload, CLIENT_IP, 1_000_001).expect("accepted");
 
         let mut reloaded =
-            SpaVerifier::load(vec![client], 300, &state_path, TEST_SERVER_PUBKEY, false)
+            SpaVerifier::load(vec![client], 300, &state_path, TEST_SERVER_PRIV, false)
                 .expect("verifier loads persisted state");
         assert!(matches!(
-            reloaded.verify(&payload, 1_000_002),
+            reloaded.verify(&payload, CLIENT_IP, 1_000_002),
             Err(SpaVerifyError::ReplayedCounter)
         ));
 
@@ -356,39 +455,56 @@ mod tests {
 
     #[test]
     fn tier_check_is_gated_behind_valid_signature() {
-        // F-016: a decoy-tier client with a *valid* signature is rejected as
+        // A decoy-tier client with a *valid* signature is rejected as
         // UnauthorizedTier (tier is reachable only after the signature passes).
         let decoy_key = generate_ed25519_keypair();
         let mut decoy = client_from_key("decoy-client", &decoy_key);
         decoy.tier = ClientTier::Decoy;
-        let mut verifier = SpaVerifier::new(vec![decoy], 300, TEST_SERVER_PUBKEY);
-        let payload =
-            SpaPacket::build(&decoy_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
+        let mut verifier = SpaVerifier::new(vec![decoy], 300, TEST_SERVER_PRIV);
+        let payload = build_spa(&decoy_key, SpaMode::Udp, 1_000_000, 1);
 
         assert!(matches!(
-            verifier.verify(&payload, 1_000_001),
+            verifier.verify(&payload, CLIENT_IP, 1_000_001),
             Err(SpaVerifyError::UnauthorizedTier(_))
         ));
 
-        // A full-tier client whose packet carries a signature from a *different*
-        // key must fail signature verification before the tier branch.
+        // A packet whose key_id matches an enrolled client but whose signature is
+        // from a different key must fail signature verification before the tier
+        // branch. Enroll the client under `wrong_key`'s public key (but
+        // `full_key`'s key_id), then present a packet signed by `full_key`.
         let full_key = generate_ed25519_keypair();
         let wrong_key = generate_ed25519_keypair();
-        let full = client_from_key("full-client", &full_key);
-        let mut verifier = SpaVerifier::new(vec![full], 300, TEST_SERVER_PUBKEY);
-        let mut forged =
-            SpaPacket::build(&wrong_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
-        let legit =
-            SpaPacket::build(&full_key, SpaMode::Udp, 1_000_000, 1, &TEST_SERVER_PUBKEY);
-        let key_id_len = full_key.verifying_key().to_bytes().len().min(8);
-        // key_id sits at offset 3 in the packet (version(2) + flags(1)).
-        let key_id_offset = 3;
-        forged[key_id_offset..key_id_offset + key_id_len]
-            .copy_from_slice(&legit[key_id_offset..key_id_offset + key_id_len]);
+        let mut mismatched =
+            client_with_public_key("full-client", &full_key, wrong_key.verifying_key());
+        mismatched.tier = ClientTier::Decoy; // would be UnauthorizedTier if sig were skipped
+        let mut verifier = SpaVerifier::new(vec![mismatched], 300, TEST_SERVER_PRIV);
+        let payload = build_spa(&full_key, SpaMode::Udp, 1_000_000, 1);
 
         assert!(matches!(
-            verifier.verify(&forged, 1_000_001),
+            verifier.verify(&payload, CLIENT_IP, 1_000_001),
             Err(SpaVerifyError::Parse(SpaError::BadSignature))
+        ));
+    }
+
+    #[test]
+    fn rejects_packet_sealed_to_a_different_server() {
+        // A SPA sealed to another server cannot even be opened (AEAD fails).
+        let signing_key = generate_ed25519_keypair();
+        let client = client_from_key("jared-laptop", &signing_key);
+        let other_server_pub = x25519_public_from_private(&[0x11u8; 32]);
+        let payload = SpaPacket::build(
+            &signing_key,
+            SpaMode::Udp,
+            1_000_000,
+            1,
+            SpaAllowIp::Explicit(CLIENT_IP),
+            &other_server_pub,
+        );
+        let mut verifier = SpaVerifier::new(vec![client], 300, TEST_SERVER_PRIV);
+
+        assert!(matches!(
+            verifier.verify(&payload, CLIENT_IP, 1_000_001),
+            Err(SpaVerifyError::Parse(SpaError::SealOpenFailed))
         ));
     }
 
@@ -400,8 +516,7 @@ mod tests {
         let second = client_from_key("second", &second_key);
         let first_key_id = first.key_id;
 
-        let mut verifier =
-            SpaVerifier::new(vec![first, second.clone()], 300, TEST_SERVER_PUBKEY);
+        let mut verifier = SpaVerifier::new(vec![first, second.clone()], 300, TEST_SERVER_PRIV);
         let removed = verifier.reload_clients(vec![second]);
 
         assert_eq!(vec![first_key_id], removed);

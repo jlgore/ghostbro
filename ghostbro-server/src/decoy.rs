@@ -24,7 +24,7 @@ use crate::ebpf::HttpsSpaCandidate;
 pub struct DecoyState {
     spa_tx: Option<mpsc::Sender<HttpsSpaCandidate>>,
     response_status: StatusCode,
-    trust_forwarded_for: bool,
+    /// A non-empty list is the X-Forwarded-For trust grant (§9).
     trusted_proxy_cidrs: Vec<IpNet>,
     webroot: Option<PathBuf>,
 }
@@ -51,7 +51,6 @@ pub fn router(
     spa_tx: Option<mpsc::Sender<HttpsSpaCandidate>>,
     spa_path: &str,
     response_status: u16,
-    trust_forwarded_for: bool,
     trusted_proxy_cidrs: &[String],
     webroot: Option<&str>,
 ) -> anyhow::Result<Router> {
@@ -65,7 +64,6 @@ pub fn router(
         .with_state(DecoyState {
             spa_tx,
             response_status,
-            trust_forwarded_for,
             trusted_proxy_cidrs,
             // Canonicalize the webroot once at construction so per-request
             // containment checks compare against a symlink-resolved, absolute
@@ -180,12 +178,7 @@ async fn telemetry(
 
     if let (Some(spa_tx), Some(ip)) = (
         &state.spa_tx,
-        https_spa_source_ip(
-            peer,
-            &headers,
-            state.trust_forwarded_for,
-            &state.trusted_proxy_cidrs,
-        ),
+        https_spa_source_ip(peer, &headers, &state.trusted_proxy_cidrs),
     ) {
         let candidate = HttpsSpaCandidate {
             src_ip: u32::from_be_bytes(ip.octets()),
@@ -220,13 +213,14 @@ fn parse_trusted_proxy_cidrs(cidrs: &[String]) -> anyhow::Result<Vec<IpNet>> {
 fn https_spa_source_ip(
     peer: SocketAddr,
     headers: &HeaderMap,
-    trust_forwarded_for: bool,
     trusted_proxy_cidrs: &[IpNet],
 ) -> Option<Ipv4Addr> {
-    if trust_forwarded_for
-        && trusted_proxy_cidrs
-            .iter()
-            .any(|cidr| cidr.contains(&peer.ip()))
+    // A non-empty trusted-proxy list is the trust grant: honor X-Forwarded-For
+    // only when the TCP peer is one of the configured reverse proxies. An empty
+    // list means the TCP peer address is always authoritative (§9).
+    if trusted_proxy_cidrs
+        .iter()
+        .any(|cidr| cidr.contains(&peer.ip()))
     {
         if let Some(ip) = forwarded_for_first_ipv4(headers) {
             tracing::debug!(peer = %peer.ip(), forwarded_for = %ip, "using trusted X-Forwarded-For source IP");
@@ -351,13 +345,13 @@ mod tests {
 
     #[test]
     fn accepts_configured_https_spa_response_status() {
-        assert!(router(None, "/api/v1/telemetry", 200, false, &[], None).is_ok());
-        assert!(router(None, "/api/v1/telemetry", 204, false, &[], None).is_ok());
+        assert!(router(None, "/api/v1/telemetry", 200, &[], None).is_ok());
+        assert!(router(None, "/api/v1/telemetry", 204, &[], None).is_ok());
     }
 
     #[test]
     fn rejects_invalid_https_spa_response_status() {
-        assert!(router(None, "/api/v1/telemetry", 42, false, &[], None).is_err());
+        assert!(router(None, "/api/v1/telemetry", 42, &[], None).is_err());
     }
 
     #[test]
@@ -420,7 +414,7 @@ mod tests {
         headers.insert("x-forwarded-for", "198.51.100.10".parse().expect("header"));
         let cidrs = parse_trusted_proxy_cidrs(&["127.0.0.1/32".to_owned()]).expect("cidrs");
 
-        let source = https_spa_source_ip(peer, &headers, true, &cidrs).expect("source");
+        let source = https_spa_source_ip(peer, &headers, &cidrs).expect("source");
 
         assert_eq!(Ipv4Addr::new(198, 51, 100, 10), source);
     }
@@ -432,7 +426,7 @@ mod tests {
         headers.insert("x-forwarded-for", "198.51.100.10".parse().expect("header"));
         let cidrs = parse_trusted_proxy_cidrs(&["127.0.0.1/32".to_owned()]).expect("cidrs");
 
-        let source = https_spa_source_ip(peer, &headers, true, &cidrs).expect("source");
+        let source = https_spa_source_ip(peer, &headers, &cidrs).expect("source");
 
         assert_eq!(Ipv4Addr::new(203, 0, 113, 5), source);
     }
@@ -444,7 +438,7 @@ mod tests {
         headers.insert("x-forwarded-for", "not-an-ip".parse().expect("header"));
         let cidrs = parse_trusted_proxy_cidrs(&["127.0.0.1/32".to_owned()]).expect("cidrs");
 
-        let source = https_spa_source_ip(peer, &headers, true, &cidrs).expect("source");
+        let source = https_spa_source_ip(peer, &headers, &cidrs).expect("source");
 
         assert_eq!(Ipv4Addr::LOCALHOST, source);
     }
@@ -459,7 +453,7 @@ mod tests {
         );
         let cidrs = parse_trusted_proxy_cidrs(&["127.0.0.1/32".to_owned()]).expect("cidrs");
 
-        let source = https_spa_source_ip(peer, &headers, true, &cidrs).expect("source");
+        let source = https_spa_source_ip(peer, &headers, &cidrs).expect("source");
 
         assert_eq!(Ipv4Addr::new(198, 51, 100, 10), source);
     }
