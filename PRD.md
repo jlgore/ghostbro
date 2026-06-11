@@ -219,7 +219,7 @@ Ed25519_Sign(client_private_key,
 
 **Padding**: Random bytes appended after the tag to vary total packet size (see §4.4). Not covered by the AEAD or signature.
 
-**Note on ephemeral-key encoding**: A raw X25519 public key is not perfectly uniform (the field element is `< 2^255-19`, leaving a small statistical bias in the high bits). For v0.3 this is an accepted residual, matching fwknop's encrypted-blob model. Encoding the ephemeral key with Elligator2 to make it bit-for-bit uniform is tracked under Pluggable Transports (§14).
+**Note on ephemeral-key encoding**: A raw X25519 public key is not perfectly uniform (the field element is `< 2^255-19`, leaving a small statistical bias in the high bits). The default (`transport = "raw"`) accepts this residual, matching fwknop's encrypted-blob model. Setting `transport = "obfuscated"` (§9) instead transmits an **Elligator2 representative** of the ephemeral public — bit-for-bit indistinguishable from uniform random — so the *entire* sealed packet (representative ‖ ciphertext ‖ tag ‖ padding) reads as random bytes. The representative is only a wire encoding: the recovered curve **point** is what feeds the seal KDF, the AEAD AAD, and the inner Ed25519 signature, so the authenticated material is identical to the raw path. Encoding follows obfs4 conventions (the `Randomized` Elligator2 variant from `curve25519-elligator2`, retry-until-representable keygen, randomized high bits, masked off before the forward map on decode). The on-wire layout and length range are unchanged — only the leading 32 bytes' distribution differs — so the §4.4 XDP length pre-filter is unaffected. The transport is operator-configured per deployment and must match on both ends (SPA is single-packet, so there is no negotiation; see §14).
 
 ### 4.4 UDP SPA Transport Details
 
@@ -517,8 +517,15 @@ ghostbro server-keygen --output /etc/ghostbro/server
    │       --endpoint <ip:port>       │
    │       --spa-mode <udp|https>     │
    │       --spa-port <port>          │
+   │       [--transport raw|          │
+   │        obfuscated]               │
    │                                  │
 ```
+
+The `--transport` flag selects the sealed-SPA ephemeral wire encoding (§4.3); it
+defaults to `raw` and must match the server's `[spa] transport` (§9). It is
+persisted into the per-server config entry (omitted when `raw`, so existing
+configs stay byte-identical).
 
 ### 7.3 Revocation
 
@@ -537,7 +544,9 @@ ghostbro enroll \
   --server-key "base64..." \
   --endpoint 203.0.113.42:8443 \
   --spa-mode udp \
-  --spa-port 53
+  --spa-port 53 \
+  --transport raw          # or "obfuscated" (Elligator2-uniform SPA, §4.3/§14);
+                           # must match the server's [spa] transport
 
 # Connect (SPA + tunnel + local SOCKS5 listener)
 ghostbro connect \
@@ -619,6 +628,14 @@ identity = "/etc/ghostbro/server.key"
 [spa]
 # SPA mode: "udp", "https", or "both"
 mode = "udp"
+# Sealed-SPA ephemeral wire encoding (§4.3): "raw" (default, backward-compatible)
+# or "obfuscated" (Elligator2-uniform; mitigates entropy-based detection, §10.2).
+# Single-transport per deployment: a packet using the other encoding silently
+# fails to open (the verifier does not try both, so there is no timing oracle).
+# Must match the client's per-server `transport`. An operator migrating a fleet
+# would stand up a second node on the new transport rather than accept both on
+# one node.
+transport = "raw"
 
 [spa.udp]
 # Port for UDP SPA packets
@@ -691,7 +708,7 @@ The `mode = "both"` option enables both UDP and HTTPS SPA simultaneously. The XD
 | Threat | Limitation |
 |--------|------------|
 | **Traffic analysis / flow correlation** | Observable at both endpoints. Padding and shaping are future work. |
-| **Entropy-based detection of fully-encrypted protocols** | A high-entropy, protocol-unidentifiable flow (no TLS handshake on the proxy port; random-looking SPA) is itself a detectable *class* — state adversaries have actively blocked fully-encrypted flows since ~2021 (e.g. GFW popcount/entropy heuristics, Wu et al., USENIX Security 2023). v0.3 does **not** defend against this. Mitigation is pluggable transports (§14): use HTTPS SPA mode + a TLS-fronted decoy to look like normal web traffic, and treat the raw UDP/proxy ports as higher-risk on adversaries known to do entropy classification. |
+| **Entropy-based detection of fully-encrypted protocols** | A high-entropy, protocol-unidentifiable flow (no TLS handshake on the proxy port; random-looking SPA) is itself a detectable *class* — state adversaries have actively blocked fully-encrypted flows since ~2021 (e.g. GFW popcount/entropy heuristics, Wu et al., USENIX Security 2023). **Partially mitigated (opt-in, §14):** `transport = "obfuscated"` (§4.3/§9) makes the *sealed SPA packet* bit-for-bit uniform via an Elligator2 representative of the ephemeral key, removing the one residual curve-point tell at the front of the packet. The **proxy tunnel** is not yet covered — the Noise XK `msg1` ephemeral and the raw 2-byte length framing still read as a fully-encrypted stream; a TLS/HTTP-mimic tunnel transport is the remaining work (§14). Until then, on adversaries known to do entropy classification, prefer HTTPS SPA mode + a TLS-fronted decoy and treat the raw proxy port as higher-risk. |
 | **SPA payload confidentiality under server-key compromise** | The sealed SPA is encrypted *to* the server's static key and a single-packet protocol has no server-side ephemeral, so a holder of the server static private key can decrypt captured SPA packets and recover `key_id`. Combined with a seized `authorized_keys.toml`, this can retroactively deanonymize captured SPA traffic. Inherent to single-packet auth (fwknop has the same property). Mitigated by: full-disk encryption / key in HSM so seizure does not yield the static key, and key rotation. The Noise layer (§10.1) is *not* subject to this. |
 | **On-path SPA theft for CGNAT-escape-hatch clients** | Clients that set the "use packet source" flag (§4.6) because they cannot know their public IP forgo the signed `allow_ip` binding, reopening the on-path replay race for their sessions. The Noise static-key binding (§5.2) still prevents the attacker from completing a tunnel; the residual is a denial-of-service (the attacker can win the allow-map write and the legitimate client must re-SPA). |
 | **Compromised server host** | Server seizure exposes the server private key and authorized_keys list. Mitigated by: Noise XK (past *handshake* client identities safe), full disk encryption, multi-server deployment. Note the SPA-layer caveat above. |
@@ -817,7 +834,9 @@ Web browsing through raw SOCKS5 is supported but not recommended. The Content Re
 - **Multi-hop**: Chain multiple Ghostbro instances.
 - **Mobile client**: iOS/Android with tun2socks integration.
 - **Meshtastic enrollment**: QR-code key exchange over LoRa.
-- **Pluggable transports**: obfs4-style wire format for environments that flag high-entropy / fully-encrypted flows (§10.2). Includes Elligator2 encoding of the SPA ephemeral key (§4.3) so the sealed packet is bit-for-bit uniform, and a TLS/HTTP-mimic transport for the proxy tunnel.
+- **Pluggable transports**: obfs4-style wire format for environments that flag high-entropy / fully-encrypted flows (§10.2). Selected per deployment via the `transport` knob (server `[spa]` §9, client per-server config / `enroll --transport`), default `"raw"` and fully backward-compatible — a raw client talks to a raw server exactly as before.
+  - **Delivered — Elligator2 SPA ephemeral (`transport = "obfuscated"`).** The sealed SPA packet is bit-for-bit uniform: the ephemeral X25519 public is transmitted as an Elligator2 representative (`Randomized` variant, obfs4 conventions) while all authenticated material binds the recovered point (§4.3). Operator-configured per deployment; SPA is single-packet so there is no negotiation, and the verifier runs a single transport (no try-both timing oracle).
+  - **Remaining — TLS/HTTP-mimic tunnel transport.** Wrap the Noise XK handshake + transport framing on the proxy port so the flow does not read as a raw fully-encrypted stream (Elligator2-encode the `msg1` ephemeral, frame to resemble TLS application-data records). This is the part of §10.2 not yet closed.
 - **Canary / duress key**: Alert operator when client is under coercion.
 - **QUIC SPA mode**: SPA embedded in QUIC Initial packets.
 - **Content Relay module**: Server-side web fetching, search, git clone, package download with store-and-forward queuing (see separate spec).
