@@ -464,16 +464,25 @@ Listens on the proxy port (default 8443). Only reachable after SPA authorization
 
 ```bash
 ghostbro keygen --output ~/.ghostbro/identity
-# Generates:
-#   ~/.ghostbro/identity.key     (Ed25519 private key, encrypted via argon2id)
-#   ~/.ghostbro/identity.pub     (Ed25519 public key, base64, 44 chars)
-#   ~/.ghostbro/identity.noise   (Curve25519 static key for Noise — see note)
-#   ~/.ghostbro/identity.keyid   (key_id: first 8 bytes of SHA-256, hex)
+# Generates (derived-Noise mode, default):
+#   ~/.ghostbro/identity.key       (Ed25519 private key, encrypted via argon2id)
+#   ~/.ghostbro/identity.pub       (Ed25519 public key, base64, 44 chars)
+#   ~/.ghostbro/identity.noise     (Curve25519 static *public* key for Noise — see note)
+#   ~/.ghostbro/identity.keyid     (key_id: first 8 bytes of SHA-256, hex)
+
+ghostbro keygen --output ~/.ghostbro/identity --independent-noise-key
+# Additionally generates (independent-Noise mode):
+#   ~/.ghostbro/identity.noise.key (Curve25519 static *private* key, encrypted via argon2id)
 ```
 
 Private key encrypted at rest with a user-chosen passphrase. KDF: argon2id (m=64MB, t=3, p=1, ~500ms on a modern phone).
 
-**Note on the Noise static key**: `identity.noise` is the client's X25519 static used in the Noise XK handshake. v0.3 derives it deterministically from the Ed25519 signing key via a domain-separated KDF — `X25519_static = SHA-256("ghostbro client noise static v1" || ed25519_secret)` — rather than the Ed25519→X25519 birational map. The KDF gives an independent-looking scalar (not the same secret reinterpreted), but it still **couples the two keys**: anyone who compromises the Ed25519 private key can recompute the Noise static, and the two cannot be rotated independently. The supported alternative is to generate an independent X25519 keypair for `identity.noise`; enrollment already transmits the Noise public key separately (§7.2), so nothing else changes. Pick one explicitly per deployment.
+**Note on the Noise static key**: `identity.noise` is the client's X25519 static *public* key used in the Noise XK handshake. Two modes are supported, chosen at `keygen` time:
+
+- **Derived (default).** v0.3 derives the Noise static deterministically from the Ed25519 signing key via a domain-separated KDF — `X25519_static = SHA-256("ghostbro client noise static v1" || ed25519_secret)` — rather than the Ed25519→X25519 birational map. The KDF gives an independent-looking scalar (not the same secret reinterpreted), but it still **couples the two keys**: anyone who compromises the Ed25519 private key can recompute the Noise static, and the two cannot be rotated independently. No private Noise key is stored on disk; it is re-derived on each connect.
+- **Independent (`--independent-noise-key`).** `keygen` mints a fresh random X25519 keypair, writes the public to `identity.noise` (unchanged path/format) and the private to `identity.noise.key` (mode 0600, encrypted at rest with the *same* argon2id + ChaCha20-Poly1305 scheme and passphrase as `identity.key`; written as plaintext base64 only under `--plaintext-debug`). This **decouples** the signing and key-agreement keys: compromising the Ed25519 key no longer yields the Noise static, and the two can be rotated independently.
+
+The connect paths auto-select: if `identity.noise.key` exists alongside the identity they load it; otherwise they fall back to the derived key. Existing derived identities keep working unchanged (backward compatible), and the choice is purely client-side — enrollment already transmits the Noise *public* key separately (§7.2), and the server only compares the initiator's Noise static against the enrolled `noise_public_key`, so no server change is needed either way. Pick one explicitly per deployment.
 
 **Server:**
 
@@ -529,8 +538,11 @@ Remove the client entry from `authorized_keys.toml`. The daemon detects the chan
 ### 8.1 CLI Interface
 
 ```bash
-# Generate identity
+# Generate identity (Noise static derived from the Ed25519 key)
 ghostbro keygen --output ~/.ghostbro/identity
+
+# Generate identity with an independent (decoupled) Noise static keypair (§7.1)
+ghostbro keygen --output ~/.ghostbro/identity --independent-noise-key
 
 # Enroll with a server
 ghostbro enroll \
@@ -554,6 +566,13 @@ ghostbro connect \
   --spa-mode https \
   --listen 127.0.0.1:1080
 # Overrides configured SPA mode (useful when network conditions change)
+
+# Connect binding the SPA to a known public IP (enables on-path replay binding, §4.6/§13.3)
+ghostbro connect \
+  --config ~/.ghostbro/servers/myserver.toml \
+  --allow-ip 203.0.113.7 \
+  --listen 127.0.0.1:1080
+# Off by default (packet-source mode); the flag overrides any per-server allow_ip
 
 # Revoke own key (best-effort notification to server)
 ghostbro revoke --config ~/.ghostbro/servers/myserver.toml
@@ -693,7 +712,7 @@ The `mode = "both"` option enables both UDP and HTTPS SPA simultaneously. The XD
 | **Traffic analysis / flow correlation** | Observable at both endpoints. Padding and shaping are future work. |
 | **Entropy-based detection of fully-encrypted protocols** | A high-entropy, protocol-unidentifiable flow (no TLS handshake on the proxy port; random-looking SPA) is itself a detectable *class* — state adversaries have actively blocked fully-encrypted flows since ~2021 (e.g. GFW popcount/entropy heuristics, Wu et al., USENIX Security 2023). v0.3 does **not** defend against this. Mitigation is pluggable transports (§14): use HTTPS SPA mode + a TLS-fronted decoy to look like normal web traffic, and treat the raw UDP/proxy ports as higher-risk on adversaries known to do entropy classification. |
 | **SPA payload confidentiality under server-key compromise** | The sealed SPA is encrypted *to* the server's static key and a single-packet protocol has no server-side ephemeral, so a holder of the server static private key can decrypt captured SPA packets and recover `key_id`. Combined with a seized `authorized_keys.toml`, this can retroactively deanonymize captured SPA traffic. Inherent to single-packet auth (fwknop has the same property). Mitigated by: full-disk encryption / key in HSM so seizure does not yield the static key, and key rotation. The Noise layer (§10.1) is *not* subject to this. |
-| **On-path SPA theft for CGNAT-escape-hatch clients** | Clients that set the "use packet source" flag (§4.6) because they cannot know their public IP forgo the signed `allow_ip` binding, reopening the on-path replay race for their sessions. The Noise static-key binding (§5.2) still prevents the attacker from completing a tunnel; the residual is a denial-of-service (the attacker can win the allow-map write and the legitimate client must re-SPA). |
+| **On-path SPA theft for CGNAT-escape-hatch clients** | Clients in packet-source mode (§4.6) forgo the signed `allow_ip` binding, reopening the on-path replay race for their sessions. This is the **default** for the CLI client, since it cannot reliably know its public IP; the explicit binding is opt-in via `--allow-ip` / per-server `allow_ip` (§13.3) on stable-IP deployments. Either way the Noise static-key binding (§5.2) still prevents the attacker from completing a tunnel; the residual for packet-source clients is a denial-of-service (the attacker can win the allow-map write and the legitimate client must re-SPA). |
 | **Compromised server host** | Server seizure exposes the server private key and authorized_keys list. Mitigated by: Noise XK (past *handshake* client identities safe), full disk encryption, multi-server deployment. Note the SPA-layer caveat above. |
 | **Rubber-hose cryptanalysis** | Passphrase on client key buys time to revoke, not permanent protection. |
 | **Endpoint compromise** | Out of scope. Owned client = game over regardless. |
@@ -781,6 +800,8 @@ The server still enforces the rule it always did — strictly greater than the p
 ### 13.3 NAT and IP Instability
 
 Allow-map is keyed on source IP. Clients behind CGNAT may share IPs or have IP changes mid-session. Mitigations: the Noise XK handshake provides session-level auth regardless of IP, and the server's Noise static-key binding (§5.2) — not the prologue — is what prevents allow-map hijacking by IP co-tenants. SPA refresh (§4.8) re-authorizes periodically. Clients that cannot determine their public IP may set the "use packet source" flag (§4.6) at the cost of the source-IP replay binding (§10.2).
+
+**Opting into the source-IP binding** is **off by default** because the CLI client cannot reliably know its own public IP, so it defaults to packet-source mode. A client that *does* know its egress address can opt in explicitly with `--allow-ip <Ipv4Addr>` on `connect` (or the per-server `allow_ip` key in the enrolled config; the CLI flag overrides the config). This binds the signed `allow_ip` to that address and re-enables the server-side on-path replay check (§4.6). The mode used is logged at SPA-send time (`allow_ip=explicit(<ip>)` vs `allow_ip=packet-source`). Use it on stable-IP deployments; leave it unset behind CGNAT or where the public IP is unknown/unstable.
 
 ### 13.4 Server Hardening
 

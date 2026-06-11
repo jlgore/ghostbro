@@ -3,7 +3,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs,
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -67,6 +67,11 @@ enum Command {
         /// Write a legacy plaintext private key for smoke tests and local dev only.
         #[arg(long)]
         plaintext_debug: bool,
+        /// Generate an independent random X25519 Noise static keypair instead of
+        /// deriving it from the Ed25519 signing key. Writes the private half to
+        /// `<output>.noise.key` (decoupling signing and key-agreement keys; §7.1).
+        #[arg(long)]
+        independent_noise_key: bool,
     },
     /// Generate a server Noise static identity.
     ServerKeygen {
@@ -120,6 +125,12 @@ enum Command {
         /// Optional counter file path. Defaults to <identity_key>.counter.
         #[arg(long)]
         counter_file: Option<String>,
+        /// Explicit public IPv4 to bind into the SPA (§4.6), enabling the
+        /// server-side on-path replay binding. Overrides any per-server
+        /// `allow_ip` in the config. Omit to use the CGNAT escape hatch
+        /// (packet-source mode), which forgoes the binding.
+        #[arg(long)]
+        allow_ip: Option<Ipv4Addr>,
     },
     /// Best-effort notification that this client key should be revoked.
     Revoke {
@@ -144,6 +155,10 @@ enum Command {
         /// Optional counter file path. Defaults to <identity_key>.counter.
         #[arg(long)]
         counter_file: Option<String>,
+        /// Explicit public IPv4 to bind into the SPA (§4.6). Omit for
+        /// packet-source mode (no on-path replay binding).
+        #[arg(long)]
+        allow_ip: Option<Ipv4Addr>,
     },
     /// Debug helper: send one HTTPS SPA POST using a plaintext key file.
     SendHttpsSpa {
@@ -160,6 +175,10 @@ enum Command {
         /// Optional counter file path. Defaults to <identity_key>.counter.
         #[arg(long)]
         counter_file: Option<String>,
+        /// Explicit public IPv4 to bind into the SPA (§4.6). Omit for
+        /// packet-source mode (no on-path replay binding).
+        #[arg(long)]
+        allow_ip: Option<Ipv4Addr>,
     },
     /// Debug helper: send UDP SPA, then complete one Noise XK TCP exchange.
     ConnectOnce {
@@ -407,6 +426,11 @@ struct ServerConfigEntry {
     spa_port: u16,
     server_public_key: String,
     priority: Option<u32>,
+    /// Explicit public IPv4 to bind into the SPA for the on-path replay binding
+    /// (§4.6). Omitted (`None`) means packet-source mode. A `--allow-ip` CLI flag
+    /// overrides this per-connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -482,6 +506,9 @@ struct ResolvedConnectConfig {
     proxy_endpoint: SocketAddr,
     spa_mode: SpaTransport,
     https_spa_url: Option<String>,
+    /// Explicit IPv4 to bind into the SPA (§4.6), or `None` for packet-source
+    /// mode. Resolved from the CLI `--allow-ip` override or the per-server config.
+    allow_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -516,7 +543,8 @@ fn main() -> Result<()> {
         Command::Keygen {
             output,
             plaintext_debug,
-        } => keygen(&output, plaintext_debug),
+            independent_noise_key,
+        } => keygen(&output, plaintext_debug, independent_noise_key),
         Command::ServerKeygen { output } => server_keygen(&output),
         Command::Enroll {
             server_key,
@@ -536,6 +564,7 @@ fn main() -> Result<()> {
             https_spa_url,
             allow_ttl_seconds,
             counter_file,
+            allow_ip,
         } => {
             let (resolved, policy) = resolve_connect_configs(
                 config.as_deref(),
@@ -544,6 +573,7 @@ fn main() -> Result<()> {
                 proxy_endpoint,
                 spa_mode,
                 https_spa_url.as_deref(),
+                allow_ip,
             )?;
             connect_listener(
                 identity_key,
@@ -563,6 +593,7 @@ fn main() -> Result<()> {
             server_key,
             endpoint,
             counter_file,
+            allow_ip,
         } => {
             let server_static_pubkey = read_noise_public_key_array(&server_key)?;
             send_udp_spa(
@@ -570,6 +601,7 @@ fn main() -> Result<()> {
                 &server_static_pubkey,
                 endpoint,
                 counter_file.as_deref(),
+                allow_ip,
             )
         }
         Command::SendHttpsSpa {
@@ -577,6 +609,7 @@ fn main() -> Result<()> {
             server_key,
             url,
             counter_file,
+            allow_ip,
         } => {
             let server_static_pubkey = read_noise_public_key_array(&server_key)?;
             send_https_spa(
@@ -584,6 +617,7 @@ fn main() -> Result<()> {
                 &server_static_pubkey,
                 &url,
                 counter_file.as_deref(),
+                allow_ip,
             )
         }
         Command::ConnectOnce {
@@ -768,27 +802,61 @@ fn main() -> Result<()> {
     }
 }
 
-fn keygen(output: &str, plaintext_debug: bool) -> Result<()> {
+fn keygen(output: &str, plaintext_debug: bool, independent_noise_key: bool) -> Result<()> {
     let signing_key = generate_ed25519_keypair();
     let public_key = signing_key.verifying_key();
     let key_id = key_id_for_public_key(&public_key);
-    let noise_public_key = derive_noise_static_public_key(&signing_key);
 
     let key_path = format!("{output}.key");
     let pub_path = format!("{output}.pub");
     let key_id_path = format!("{output}.keyid");
     let noise_path = format!("{output}.noise");
+    let noise_key_path = format!("{output}.noise.key");
     let counter_path = format!("{output}.counter");
 
-    if plaintext_debug {
-        write_private_key_file(&key_path, format!("{}\n", encode_signing_key(&signing_key)))
-            .with_context(|| format!("failed to write {key_path}"))?;
+    // Prompt once and reuse the passphrase for both the Ed25519 key and (if
+    // requested) the independent Noise key, so they share the same KDF scheme.
+    let passphrase = if plaintext_debug {
+        None
     } else {
-        let passphrase = prompt_new_passphrase()?;
-        let encrypted = encrypt_signing_key(&signing_key, &passphrase)?;
-        write_private_key_file(&key_path, encrypted)
-            .with_context(|| format!("failed to write {key_path}"))?;
+        Some(prompt_new_passphrase()?)
+    };
+
+    match &passphrase {
+        Some(passphrase) => {
+            let encrypted = encrypt_signing_key(&signing_key, passphrase)?;
+            write_private_key_file(&key_path, encrypted)
+                .with_context(|| format!("failed to write {key_path}"))?;
+        }
+        None => {
+            write_private_key_file(&key_path, format!("{}\n", encode_signing_key(&signing_key)))
+                .with_context(|| format!("failed to write {key_path}"))?;
+        }
     }
+
+    // Either derive the Noise static from the signing key (default, coupled) or
+    // mint an independent X25519 keypair and persist its private half (§7.1).
+    let noise_public_key = if independent_noise_key {
+        let (noise_private, noise_public) = generate_noise_static_keypair()?;
+        match &passphrase {
+            Some(passphrase) => {
+                let encrypted = encrypt_secret(&noise_private, passphrase)?;
+                write_private_key_file(&noise_key_path, encrypted)
+                    .with_context(|| format!("failed to write {noise_key_path}"))?;
+            }
+            None => {
+                write_private_key_file(
+                    &noise_key_path,
+                    format!("{}\n", STANDARD.encode(noise_private)),
+                )
+                .with_context(|| format!("failed to write {noise_key_path}"))?;
+            }
+        }
+        noise_public
+    } else {
+        derive_noise_static_public_key(&signing_key)
+    };
+
     fs::write(&pub_path, format!("{}\n", encode_public_key(&public_key)))
         .with_context(|| format!("failed to write {pub_path}"))?;
     fs::write(&key_id_path, format!("{}\n", key_id_hex(&key_id)))
@@ -809,6 +877,9 @@ fn keygen(output: &str, plaintext_debug: bool) -> Result<()> {
     println!("  public key:  {pub_path}");
     println!("  key id:      {key_id_path}");
     println!("  noise key:   {noise_path}");
+    if independent_noise_key {
+        println!("  noise priv:  {noise_key_path} (independent X25519)");
+    }
     println!("  counter:     {counter_path}");
     println!("authorized_keys.toml entry:");
     println!("[[clients]]");
@@ -871,6 +942,7 @@ fn enroll(
             spa_port,
             server_public_key: server_key.to_owned(),
             priority: Some(1),
+            allow_ip: None,
         }],
         failover: Some(FailoverConfig {
             strategy: "priority".to_owned(),
@@ -951,6 +1023,7 @@ fn resolve_connect_configs(
     proxy_endpoint: Option<SocketAddr>,
     spa_mode_override: Option<SpaTransport>,
     https_spa_url_override: Option<&str>,
+    allow_ip_override: Option<Ipv4Addr>,
 ) -> Result<(Vec<ResolvedConnectConfig>, FailoverPolicy)> {
     if let Some(config_path) = config_path {
         let config = load_client_config(config_path)?;
@@ -967,6 +1040,8 @@ fn resolve_connect_configs(
                 let https_spa_url = https_spa_url_override
                     .map(str::to_owned)
                     .or_else(|| https_spa_url_for(&server, spa_mode));
+                // CLI --allow-ip overrides the per-server config value.
+                let allow_ip = allow_ip_override.or(server.allow_ip);
 
                 Ok(ResolvedConnectConfig {
                     server_public_key: decode_noise_public_key(&server.server_public_key)?,
@@ -974,6 +1049,7 @@ fn resolve_connect_configs(
                     proxy_endpoint,
                     spa_mode,
                     https_spa_url,
+                    allow_ip,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -994,6 +1070,7 @@ fn resolve_connect_configs(
         proxy_endpoint,
         spa_mode,
         https_spa_url: https_spa_url_override.map(str::to_owned),
+        allow_ip: allow_ip_override,
     }];
     Ok((resolved, FailoverPolicy::default()))
 }
@@ -1048,11 +1125,30 @@ fn revoke_request_body(request: &RevokeRequest<'_>) -> String {
     }
 }
 
+/// Map the optional CLI/config `--allow-ip` into a [`SpaAllowIp`]. An explicit
+/// address opts into the server-side on-path replay binding (§4.6); `None` is
+/// the CGNAT escape hatch (packet-source mode), which forgoes the binding.
+fn resolve_allow_ip(allow_ip: Option<Ipv4Addr>) -> SpaAllowIp {
+    match allow_ip {
+        Some(ip) => SpaAllowIp::Explicit(ip),
+        None => SpaAllowIp::PacketSource,
+    }
+}
+
+/// Short human-readable description of the SPA source-binding mode, for logs.
+fn describe_allow_ip(allow_ip: Option<Ipv4Addr>) -> String {
+    match allow_ip {
+        Some(ip) => format!("explicit({ip})"),
+        None => "packet-source".to_owned(),
+    }
+}
+
 fn send_udp_spa(
     identity_key: &str,
     server_static_pubkey: &[u8; 32],
     endpoint: SocketAddr,
     counter_file: Option<&str>,
+    allow_ip: Option<Ipv4Addr>,
 ) -> Result<()> {
     let signing_key = read_signing_key(identity_key)?;
     let counter_path = counter_file
@@ -1060,15 +1156,15 @@ fn send_udp_spa(
         .unwrap_or_else(|| default_counter_path(identity_key));
     let timestamp_ms = unix_timestamp_ms()?;
     let counter = next_counter(&counter_path, timestamp_ms)?;
-    // The CLI client does not reliably know its own public IP, so it uses the
-    // packet-source mode by default (§4.6). Operators who can supply the public
-    // IP get the on-path replay binding via SpaAllowIp::Explicit.
+    // An explicit --allow-ip enables the on-path replay binding (§4.6); without
+    // it the client falls back to packet-source mode, since the CLI cannot
+    // reliably know its own public IP.
     let payload = SpaPacket::build(
         &signing_key,
         SpaMode::Udp,
         timestamp_ms,
         counter,
-        SpaAllowIp::PacketSource,
+        resolve_allow_ip(allow_ip),
         server_static_pubkey,
     );
 
@@ -1084,8 +1180,9 @@ fn send_udp_spa(
 
     let key_id = key_id_for_public_key(&signing_key.verifying_key());
     println!(
-        "sent UDP SPA: endpoint={endpoint} key_id={} counter={counter} bytes={}",
+        "sent UDP SPA: endpoint={endpoint} key_id={} counter={counter} allow_ip={} bytes={}",
         key_id_hex(&key_id),
+        describe_allow_ip(allow_ip),
         payload.len()
     );
 
@@ -1097,6 +1194,7 @@ fn send_https_spa(
     server_static_pubkey: &[u8; 32],
     url: &str,
     counter_file: Option<&str>,
+    allow_ip: Option<Ipv4Addr>,
 ) -> Result<()> {
     let signing_key = read_signing_key(identity_key)?;
     let counter_path = counter_file
@@ -1109,7 +1207,7 @@ fn send_https_spa(
         SpaMode::Https,
         timestamp_ms,
         counter,
-        SpaAllowIp::PacketSource,
+        resolve_allow_ip(allow_ip),
         server_static_pubkey,
     );
 
@@ -1140,8 +1238,9 @@ fn send_https_spa(
 
     let key_id = key_id_for_public_key(&signing_key.verifying_key());
     println!(
-        "sent HTTPS SPA: url={url} key_id={} counter={counter} bytes={}",
+        "sent HTTPS SPA: url={url} key_id={} counter={counter} allow_ip={} bytes={}",
         key_id_hex(&key_id),
+        describe_allow_ip(allow_ip),
         payload.len()
     );
 
@@ -1226,6 +1325,7 @@ fn connect_once(
     counter_file: Option<&str>,
 ) -> Result<()> {
     let server_static_pubkey = read_noise_public_key_array(server_key)?;
+    // Debug helper: no --allow-ip flag, so always packet-source mode.
     send_spa(
         identity_key,
         &server_static_pubkey,
@@ -1233,13 +1333,14 @@ fn connect_once(
         spa_mode,
         https_spa_url,
         counter_file,
+        None,
     )?;
     thread::sleep(Duration::from_millis(150));
 
     let signing_key = read_signing_key(identity_key)?;
     let key_id = key_id_for_public_key(&signing_key.verifying_key());
     let server_public_key = read_noise_public_key(server_key)?;
-    let noise_private_key = derive_noise_static_private_key(&signing_key);
+    let noise_private_key = load_noise_static_private(identity_key, &signing_key)?;
     let params = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .context("invalid Noise pattern")?;
@@ -1317,6 +1418,7 @@ fn connect_socks5_once(
         spa_mode,
         https_spa_url,
         counter_file,
+        None,
     )?;
 
     write_encrypted_frame(&mut stream, &mut transport, &[0x05, 0x01, 0x00], &mut buf)?;
@@ -1367,6 +1469,7 @@ fn connect_ghost_relay_once(
         spa_mode,
         https_spa_url,
         counter_file,
+        None,
     )?;
 
     write_encrypted_frame(
@@ -1613,6 +1716,7 @@ fn run_relay_request(
         spa_mode,
         https_spa_url,
         counter_file,
+        None,
     )?;
     write_encrypted_frame(&mut stream, &mut transport, request, &mut buf)?;
     read_encrypted_frame(&mut stream, &mut transport, &mut buf)
@@ -1763,6 +1867,7 @@ fn start_spa_refresh(
                             candidate.spa_mode,
                             candidate.https_spa_url.as_deref(),
                             counter_file.as_deref(),
+                            candidate.allow_ip,
                         ),
                         Err(_) => Err(anyhow::anyhow!(
                             "server Noise public key must be 32 bytes"
@@ -2017,6 +2122,7 @@ fn relay_local_socks5(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_noise(
     identity_key: &str,
     server_public_key: &[u8],
@@ -2025,6 +2131,7 @@ fn connect_noise(
     spa_mode: SpaTransport,
     https_spa_url: Option<&str>,
     counter_file: Option<&str>,
+    allow_ip: Option<Ipv4Addr>,
 ) -> Result<(
     TcpStream,
     snow::TransportState,
@@ -2041,12 +2148,13 @@ fn connect_noise(
         spa_mode,
         https_spa_url,
         counter_file,
+        allow_ip,
     )?;
     thread::sleep(Duration::from_millis(150));
 
     let signing_key = read_signing_key(identity_key)?;
     let key_id = key_id_for_public_key(&signing_key.verifying_key());
-    let noise_private_key = derive_noise_static_private_key(&signing_key);
+    let noise_private_key = load_noise_static_private(identity_key, &signing_key)?;
     let params = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .context("invalid Noise pattern")?;
@@ -2124,6 +2232,7 @@ fn connect_noise_with_failover(
                 candidate.spa_mode,
                 candidate.https_spa_url.as_deref(),
                 counter_file,
+                candidate.allow_ip,
             ) {
                 Ok((stream, transport, buf, key_id)) => {
                     if !(round == 0 && position == 0) {
@@ -2221,14 +2330,19 @@ fn send_spa(
     spa_mode: SpaTransport,
     https_spa_url: Option<&str>,
     counter_file: Option<&str>,
+    allow_ip: Option<Ipv4Addr>,
 ) -> Result<()> {
     match spa_mode {
-        SpaTransport::Udp => {
-            send_udp_spa(identity_key, server_static_pubkey, spa_endpoint, counter_file)
-        }
+        SpaTransport::Udp => send_udp_spa(
+            identity_key,
+            server_static_pubkey,
+            spa_endpoint,
+            counter_file,
+            allow_ip,
+        ),
         SpaTransport::Https => {
             let url = https_spa_url.context("--https-spa-url is required when --spa-mode https")?;
-            send_https_spa(identity_key, server_static_pubkey, url, counter_file)
+            send_https_spa(identity_key, server_static_pubkey, url, counter_file, allow_ip)
         }
     }
 }
@@ -2433,15 +2547,34 @@ fn encrypt_signing_key(
     signing_key: &ed25519_dalek::SigningKey,
     passphrase: &str,
 ) -> Result<String> {
+    encrypt_secret(&signing_key.to_bytes(), passphrase)
+}
+
+/// Encrypt a raw 32-byte secret with a fresh random salt and nonce.
+fn encrypt_secret(secret: &[u8], passphrase: &str) -> Result<String> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce);
-    encrypt_signing_key_with_salt_nonce(signing_key, passphrase, &salt, &nonce)
+    encrypt_secret_with_salt_nonce(secret, passphrase, &salt, &nonce)
 }
 
+#[cfg(test)]
 fn encrypt_signing_key_with_salt_nonce(
     signing_key: &ed25519_dalek::SigningKey,
+    passphrase: &str,
+    salt: &[u8],
+    nonce: &[u8],
+) -> Result<String> {
+    encrypt_secret_with_salt_nonce(&signing_key.to_bytes(), passphrase, salt, nonce)
+}
+
+/// Encrypt a raw 32-byte secret (Ed25519 signing key or X25519 Noise static) at
+/// rest using the argon2id + ChaCha20-Poly1305 scheme, returning the serialized
+/// [`EncryptedIdentityKey`] TOML. Shared by the signing key and the optional
+/// independent Noise key (§7.1) so both use the same passphrase-derived KDF.
+fn encrypt_secret_with_salt_nonce(
+    secret: &[u8],
     passphrase: &str,
     salt: &[u8],
     nonce: &[u8],
@@ -2453,7 +2586,7 @@ fn encrypt_signing_key_with_salt_nonce(
     let cipher = ChaCha20Poly1305::new((&key).into());
     let nonce = Nonce::from_slice(nonce);
     let ciphertext = cipher
-        .encrypt(nonce, signing_key.to_bytes().as_slice())
+        .encrypt(nonce, secret)
         .map_err(|_| anyhow::anyhow!("failed to encrypt identity key"))?;
     let identity = EncryptedIdentityKey {
         version: IDENTITY_KEY_VERSION,
@@ -2475,6 +2608,14 @@ fn decrypt_signing_key(
     identity: &EncryptedIdentityKey,
     passphrase: &str,
 ) -> Result<ed25519_dalek::SigningKey> {
+    let bytes = decrypt_secret_bytes(identity, passphrase)?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
+}
+
+/// Decrypt and return the raw 32-byte secret from an [`EncryptedIdentityKey`],
+/// validating the scheme parameters. Shared by the Ed25519 signing key and the
+/// optional independent X25519 Noise static key (§7.1).
+fn decrypt_secret_bytes(identity: &EncryptedIdentityKey, passphrase: &str) -> Result<[u8; 32]> {
     if identity.version != IDENTITY_KEY_VERSION {
         anyhow::bail!(
             "unsupported encrypted identity key version {}",
@@ -2514,13 +2655,12 @@ fn decrypt_signing_key(
         .map_err(|_| {
             anyhow::anyhow!("failed to decrypt identity key: bad passphrase or corrupt key file")
         })?;
-    let bytes: [u8; 32] = plaintext.try_into().map_err(|bytes: Vec<u8>| {
+    plaintext.try_into().map_err(|bytes: Vec<u8>| {
         anyhow::anyhow!(
             "decrypted identity key must be 32 bytes, got {}",
             bytes.len()
         )
-    })?;
-    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
+    })
 }
 
 fn derive_identity_key(passphrase: &str, salt: &[u8]) -> Result<[u8; ARGON2_KEY_LEN]> {
@@ -2555,6 +2695,93 @@ fn read_signing_key(path: impl AsRef<Path>) -> Result<ed25519_dalek::SigningKey>
                 path.display()
             )
         }),
+    }
+}
+
+/// Generate a random X25519 static keypair for Noise, returning
+/// `(private, public)`. Uses snow's keypair generator so the public half
+/// matches what the handshake derives from the private (§7.1).
+fn generate_noise_static_keypair() -> Result<([u8; 32], [u8; 32])> {
+    let params = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
+        .parse()
+        .context("invalid Noise pattern")?;
+    let keypair = snow::Builder::new(params)
+        .generate_keypair()
+        .context("failed to generate independent Noise static keypair")?;
+    let private: [u8; 32] = keypair
+        .private
+        .as_slice()
+        .try_into()
+        .context("Noise static private key must be 32 bytes")?;
+    let public: [u8; 32] = keypair
+        .public
+        .as_slice()
+        .try_into()
+        .context("Noise static public key must be 32 bytes")?;
+    Ok((private, public))
+}
+
+/// On-disk path of the optional independent Noise static private key, derived
+/// from the Ed25519 identity-key path: `<prefix>.key` → `<prefix>.noise.key`.
+fn independent_noise_key_path(identity_key: &str) -> PathBuf {
+    let path = Path::new(identity_key);
+    if path.extension().is_some_and(|extension| extension == "key") {
+        path.with_extension("noise.key")
+    } else {
+        PathBuf::from(format!("{identity_key}.noise.key"))
+    }
+}
+
+/// Resolve the client's Noise static private key. If an independent key file
+/// exists alongside the identity (§7.1), load it; otherwise fall back to the
+/// legacy key derived from the Ed25519 signing key. This keeps existing derived
+/// identities working unchanged while allowing decoupled keypairs.
+fn load_noise_static_private(
+    identity_key: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<[u8; 32]> {
+    let path = independent_noise_key_path(identity_key);
+    if path.exists() {
+        let private = read_noise_private_key(&path).with_context(|| {
+            format!(
+                "failed to load independent Noise static key {}",
+                path.display()
+            )
+        })?;
+        println!("NOISE_STATIC_KEY mode=independent path={}", path.display());
+        Ok(private)
+    } else {
+        Ok(derive_noise_static_private_key(signing_key))
+    }
+}
+
+/// Read an independent Noise static private key (encrypted [`EncryptedIdentityKey`]
+/// TOML, or legacy plaintext base64), mirroring [`read_signing_key`].
+fn read_noise_private_key(path: impl AsRef<Path>) -> Result<[u8; 32]> {
+    let path = path.as_ref();
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Noise static key {}", path.display()))?;
+    match toml::from_str::<EncryptedIdentityKey>(&contents) {
+        Ok(identity) => {
+            let passphrase = prompt_existing_passphrase(path)?;
+            decrypt_secret_bytes(&identity, &passphrase)
+                .with_context(|| format!("failed to decrypt Noise static key {}", path.display()))
+        }
+        Err(_) => {
+            let bytes = STANDARD.decode(contents.trim()).with_context(|| {
+                format!(
+                    "failed to decode plaintext Noise static key {}",
+                    path.display()
+                )
+            })?;
+            bytes.try_into().map_err(|bytes: Vec<u8>| {
+                anyhow::anyhow!(
+                    "Noise static key {} must be 32 bytes, got {}",
+                    path.display(),
+                    bytes.len()
+                )
+            })
+        }
     }
 }
 
@@ -2743,7 +2970,7 @@ mod tests {
     #[test]
     fn keygen_plaintext_debug_writes_legacy_identity_key() {
         let prefix = temp_path("debug-identity");
-        keygen(prefix.to_str().expect("utf8 path"), true).expect("keygen succeeds");
+        keygen(prefix.to_str().expect("utf8 path"), true, false).expect("keygen succeeds");
         let key_path = prefix.with_extension("key");
         let pub_path = prefix.with_extension("pub");
         let key_id_path = prefix.with_extension("keyid");
@@ -2798,7 +3025,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let prefix = temp_path("private-mode");
-        keygen(prefix.to_str().expect("utf8 path"), true).expect("keygen succeeds");
+        keygen(prefix.to_str().expect("utf8 path"), true, false).expect("keygen succeeds");
         let key_path = prefix.with_extension("key");
 
         let mode = fs::metadata(&key_path)
@@ -2863,6 +3090,7 @@ mod tests {
                     spa_port: 5353,
                     server_public_key: STANDARD.encode([1u8; 32]),
                     priority: Some(2),
+                    allow_ip: None,
                 },
                 ServerConfigEntry {
                     endpoint: "127.0.0.1:9443".to_owned(),
@@ -2871,6 +3099,7 @@ mod tests {
                     spa_port: 443,
                     server_public_key: STANDARD.encode([2u8; 32]),
                     priority: Some(1),
+                    allow_ip: None,
                 },
             ],
             failover: None,
@@ -2915,6 +3144,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("resolve config");
 
@@ -2941,6 +3171,7 @@ mod tests {
                 proxy_endpoint: format!("127.0.0.1:{}", 8000 + index).parse().unwrap(),
                 spa_mode: SpaTransport::Udp,
                 https_spa_url: None,
+                allow_ip: None,
             })
             .collect()
     }
@@ -3051,6 +3282,7 @@ mod tests {
             spa_port: 443,
             server_public_key: STANDARD.encode([1u8; 32]),
             priority: Some(1),
+            allow_ip: None,
         };
 
         assert!(revoke_url_for(&server).is_none());
@@ -3078,5 +3310,137 @@ mod tests {
                 key_id: None
             })
         );
+    }
+
+    #[test]
+    fn resolve_allow_ip_maps_explicit_and_packet_source() {
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        assert_eq!(SpaAllowIp::Explicit(ip), resolve_allow_ip(Some(ip)));
+        assert_eq!(SpaAllowIp::PacketSource, resolve_allow_ip(None));
+    }
+
+    #[test]
+    fn allow_ip_parses_from_config_and_cli_overrides() {
+        let path = temp_path("allow-ip-servers");
+        let toml = format!(
+            r#"
+            [[servers]]
+            endpoint = "127.0.0.1:8443"
+            spa_endpoint = "127.0.0.1"
+            spa_mode = "udp"
+            spa_port = 5353
+            server_public_key = "{}"
+            priority = 1
+            allow_ip = "203.0.113.7"
+            "#,
+            STANDARD.encode([4u8; 32])
+        );
+        fs::write(&path, &toml).expect("write config");
+
+        // No CLI override: the per-server config value is used.
+        let (resolved, _) = resolve_connect_configs(
+            Some(path.to_str().expect("utf8 path")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve config");
+        assert_eq!(Some(Ipv4Addr::new(203, 0, 113, 7)), resolved[0].allow_ip);
+
+        // CLI --allow-ip overrides the config value.
+        let override_ip = Ipv4Addr::new(198, 51, 100, 9);
+        let (resolved, _) = resolve_connect_configs(
+            Some(path.to_str().expect("utf8 path")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(override_ip),
+        )
+        .expect("resolve config");
+        assert_eq!(Some(override_ip), resolved[0].allow_ip);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn independent_noise_key_path_matches_keygen_output() {
+        assert_eq!(
+            PathBuf::from("identity.noise.key"),
+            independent_noise_key_path("identity.key")
+        );
+        assert_eq!(
+            PathBuf::from("identity.debug.noise.key"),
+            independent_noise_key_path("identity.debug")
+        );
+    }
+
+    #[test]
+    fn independent_noise_keypair_round_trips() {
+        let prefix = temp_path("independent-noise");
+        let prefix_str = prefix.to_str().expect("utf8 path").to_owned();
+        keygen(&prefix_str, true, true).expect("keygen with independent noise key");
+
+        let key_path = format!("{prefix_str}.key");
+        let noise_pub_path = format!("{prefix_str}.noise");
+        let noise_key_path = format!("{prefix_str}.noise.key");
+        assert!(
+            Path::new(&noise_key_path).exists(),
+            "independent noise private key file must be written"
+        );
+
+        let signing_key = read_signing_key(&key_path).expect("loads signing key");
+        // The independent file exists, so this loads it (not the derived key).
+        let noise_private =
+            load_noise_static_private(&key_path, &signing_key).expect("loads noise private");
+        assert_ne!(
+            ghostbro_common::keys::derive_noise_static_private_key(&signing_key),
+            noise_private,
+            "independent key must differ from the derived key"
+        );
+
+        // The public derived from the loaded private must equal the written .noise.
+        let written_pub = decode_noise_public_key(
+            fs::read_to_string(&noise_pub_path)
+                .expect("read noise pub")
+                .trim(),
+        )
+        .expect("decode noise pub");
+        let computed_pub = ghostbro_common::keys::derive_noise_public_from_private(&noise_private);
+        assert_eq!(written_pub.as_slice(), computed_pub.as_slice());
+
+        for suffix in ["key", "pub", "keyid", "noise", "noise.key", "counter"] {
+            let _ = fs::remove_file(format!("{prefix_str}.{suffix}"));
+        }
+    }
+
+    #[test]
+    fn derived_noise_static_loads_when_no_independent_file() {
+        let prefix = temp_path("derived-noise");
+        let prefix_str = prefix.to_str().expect("utf8 path").to_owned();
+        keygen(&prefix_str, true, false).expect("keygen derived identity");
+
+        let key_path = format!("{prefix_str}.key");
+        assert!(
+            !Path::new(&format!("{prefix_str}.noise.key")).exists(),
+            "derived identity must not write a .noise.key file"
+        );
+
+        let signing_key = read_signing_key(&key_path).expect("loads signing key");
+        let noise_private =
+            load_noise_static_private(&key_path, &signing_key).expect("loads noise private");
+        assert_eq!(
+            ghostbro_common::keys::derive_noise_static_private_key(&signing_key),
+            noise_private,
+            "without an independent file the key must be derived (legacy/backward-compatible)"
+        );
+
+        for suffix in ["key", "pub", "keyid", "noise", "counter"] {
+            let _ = fs::remove_file(format!("{prefix_str}.{suffix}"));
+        }
     }
 }
