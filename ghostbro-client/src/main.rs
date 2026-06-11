@@ -34,7 +34,7 @@ use ghostbro_common::{
     protocol::{
         DEFAULT_TIME_WINDOW_SECONDS, GHOST_RELAY_STATUS_UNSUPPORTED, PROTOCOL_GHOST_RELAY,
     },
-    spa::{SpaMode, SpaPacket},
+    spa::{SpaAllowIp, SpaMode, SpaPacket},
 };
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use serde::{Deserialize, Serialize};
@@ -161,7 +161,7 @@ enum Command {
         #[arg(long)]
         counter_file: Option<String>,
     },
-    /// Debug helper: send UDP SPA, then complete one Noise IK TCP exchange.
+    /// Debug helper: send UDP SPA, then complete one Noise XK TCP exchange.
     ConnectOnce {
         /// Path to encrypted or legacy plaintext Ed25519 identity key from `keygen`.
         #[arg(long)]
@@ -826,7 +826,7 @@ fn keygen(output: &str, plaintext_debug: bool) -> Result<()> {
 fn server_keygen(output: &str) -> Result<()> {
     let key_path = format!("{output}.key");
     let pub_path = format!("{output}.pub");
-    let params = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+    let params = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .context("invalid Noise pattern")?;
     let keypair = snow::Builder::new(params)
@@ -1058,13 +1058,17 @@ fn send_udp_spa(
     let counter_path = counter_file
         .map(PathBuf::from)
         .unwrap_or_else(|| default_counter_path(identity_key));
-    let counter = increment_counter(&counter_path)?;
     let timestamp_ms = unix_timestamp_ms()?;
+    let counter = next_counter(&counter_path, timestamp_ms)?;
+    // The CLI client does not reliably know its own public IP, so it uses the
+    // packet-source mode by default (§4.6). Operators who can supply the public
+    // IP get the on-path replay binding via SpaAllowIp::Explicit.
     let payload = SpaPacket::build(
         &signing_key,
         SpaMode::Udp,
         timestamp_ms,
         counter,
+        SpaAllowIp::PacketSource,
         server_static_pubkey,
     );
 
@@ -1098,13 +1102,14 @@ fn send_https_spa(
     let counter_path = counter_file
         .map(PathBuf::from)
         .unwrap_or_else(|| default_counter_path(identity_key));
-    let counter = increment_counter(&counter_path)?;
     let timestamp_ms = unix_timestamp_ms()?;
+    let counter = next_counter(&counter_path, timestamp_ms)?;
     let payload = SpaPacket::build(
         &signing_key,
         SpaMode::Https,
         timestamp_ms,
         counter,
+        SpaAllowIp::PacketSource,
         server_static_pubkey,
     );
 
@@ -1235,7 +1240,7 @@ fn connect_once(
     let key_id = key_id_for_public_key(&signing_key.verifying_key());
     let server_public_key = read_noise_public_key(server_key)?;
     let noise_private_key = derive_noise_static_private_key(&signing_key);
-    let params = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+    let params = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .context("invalid Noise pattern")?;
     let mut noise = snow::Builder::new(params)
@@ -1243,7 +1248,7 @@ fn connect_once(
         .remote_public_key(&server_public_key)
         .prologue(&key_id)
         .build_initiator()
-        .context("failed to build Noise IK initiator")?;
+        .context("failed to build Noise XK initiator")?;
 
     let mut stream = TcpStream::connect(proxy_endpoint).with_context(|| {
         format!(
@@ -1251,16 +1256,23 @@ fn connect_once(
             spa_authorization_hint()
         )
     })?;
+    // Noise XK initiator: write msg1 (e), read msg2 (e, ee), write msg3 (s, se).
     let mut buf = vec![0u8; 16 * 1024];
     let len = noise
         .write_message(&[], &mut buf)
-        .context("failed to write Noise IK message 1")?;
+        .context("failed to write Noise XK message 1")?;
     write_frame(&mut stream, &buf[..len])?;
 
     let msg2 = read_frame(&mut stream)?;
     noise
         .read_message(&msg2, &mut buf)
-        .context("failed to read Noise IK message 2")?;
+        .context("failed to read Noise XK message 2")?;
+
+    let len = noise
+        .write_message(&[], &mut buf)
+        .context("failed to write Noise XK message 3")?;
+    write_frame(&mut stream, &buf[..len])?;
+
     let mut transport = noise
         .into_transport_mode()
         .context("failed to enter Noise transport mode")?;
@@ -2035,7 +2047,7 @@ fn connect_noise(
     let signing_key = read_signing_key(identity_key)?;
     let key_id = key_id_for_public_key(&signing_key.verifying_key());
     let noise_private_key = derive_noise_static_private_key(&signing_key);
-    let params = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+    let params = "Noise_XK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .context("invalid Noise pattern")?;
     let mut noise = snow::Builder::new(params)
@@ -2043,7 +2055,7 @@ fn connect_noise(
         .remote_public_key(server_public_key)
         .prologue(&key_id)
         .build_initiator()
-        .context("failed to build Noise IK initiator")?;
+        .context("failed to build Noise XK initiator")?;
 
     let mut stream = TcpStream::connect(proxy_endpoint).with_context(|| {
         format!(
@@ -2051,16 +2063,23 @@ fn connect_noise(
             spa_authorization_hint()
         )
     })?;
+    // Noise XK initiator: write msg1 (e), read msg2 (e, ee), write msg3 (s, se).
     let mut buf = vec![0u8; 16 * 1024];
     let len = noise
         .write_message(&[], &mut buf)
-        .context("failed to write Noise IK message 1")?;
+        .context("failed to write Noise XK message 1")?;
     write_frame(&mut stream, &buf[..len])?;
 
     let msg2 = read_frame(&mut stream)?;
     noise
         .read_message(&msg2, &mut buf)
-        .context("failed to read Noise IK message 2")?;
+        .context("failed to read Noise XK message 2")?;
+
+    let len = noise
+        .write_message(&[], &mut buf)
+        .context("failed to write Noise XK message 3")?;
+    write_frame(&mut stream, &buf[..len])?;
+
     let transport = noise
         .into_transport_mode()
         .context("failed to enter Noise transport mode")?;
@@ -2539,7 +2558,15 @@ fn read_signing_key(path: impl AsRef<Path>) -> Result<ed25519_dalek::SigningKey>
     }
 }
 
-fn increment_counter(path: impl AsRef<Path>) -> Result<u64> {
+/// Choose the next SPA counter, derived from the timestamp floor (§13.2a).
+///
+/// The counter is `max(stored + 1, floor)` where `floor` is the current
+/// timestamp in milliseconds. Deriving from the timestamp means a client that
+/// loses its local counter state (reinstall, restore from backup, second
+/// device) still emits a value above the server's persisted high-water mark
+/// instead of being silently rejected as a replay — which by design is
+/// indistinguishable from network failure.
+fn next_counter(path: impl AsRef<Path>, floor: u64) -> Result<u64> {
     let path = path.as_ref();
     let current = match fs::read_to_string(path) {
         Ok(contents) => contents
@@ -2552,7 +2579,7 @@ fn increment_counter(path: impl AsRef<Path>) -> Result<u64> {
         }
     };
 
-    let next = current.saturating_add(1);
+    let next = current.saturating_add(1).max(floor);
     fs::write(path, format!("{next}\n"))
         .with_context(|| format!("failed to write counter file {}", path.display()))?;
     Ok(next)
@@ -2634,11 +2661,28 @@ mod tests {
     }
 
     #[test]
-    fn increments_missing_counter_from_one() {
+    fn next_counter_increments_from_one_with_zero_floor() {
         let path = temp_path("counter");
 
-        assert_eq!(1, increment_counter(&path).expect("first increment"));
-        assert_eq!(2, increment_counter(&path).expect("second increment"));
+        assert_eq!(1, next_counter(&path, 0).expect("first increment"));
+        assert_eq!(2, next_counter(&path, 0).expect("second increment"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn next_counter_jumps_to_timestamp_floor_on_state_loss() {
+        // A fresh client (no stored counter) derives the counter from the
+        // timestamp floor, exceeding any prior server high-water mark (§13.2a).
+        let path = temp_path("counter-floor");
+
+        let floor = 1_725_000_000_000;
+        assert_eq!(floor, next_counter(&path, floor).expect("derives from floor"));
+        // Subsequent counter is strictly greater even with the same floor.
+        assert_eq!(
+            floor + 1,
+            next_counter(&path, floor).expect("monotonic above floor")
+        );
 
         let _ = fs::remove_file(path);
     }

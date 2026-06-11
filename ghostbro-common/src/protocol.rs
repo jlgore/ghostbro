@@ -4,16 +4,39 @@ pub const SPA_FLAGS_LEN: usize = 1;
 pub const KEY_ID_LEN: usize = 8;
 pub const TIMESTAMP_LEN: usize = 8;
 pub const COUNTER_LEN: usize = 8;
-pub const NONCE_LEN: usize = 16;
+pub const ALLOW_IP_LEN: usize = 4;
 pub const SIGNATURE_LEN: usize = 64;
 
-pub const SPA_SIGNED_LEN: usize =
-    VERSION_LEN + SPA_FLAGS_LEN + KEY_ID_LEN + TIMESTAMP_LEN + COUNTER_LEN + NONCE_LEN;
-pub const SPA_MIN_LEN: usize = SPA_SIGNED_LEN + SIGNATURE_LEN;
-pub const SPA_MAX_LEN: usize = 128;
+// --- Sealed SPA inner record (the plaintext that is sealed to the server) ---
+//
+// Layout: version | flags | key_id | timestamp_ms | counter | allow_ip | signature
+// The signature (Ed25519) covers the signed region plus the per-packet ephemeral
+// public key and the server static public key (associated data, not transmitted).
+pub const SPA_INNER_SIGNED_LEN: usize =
+    VERSION_LEN + SPA_FLAGS_LEN + KEY_ID_LEN + TIMESTAMP_LEN + COUNTER_LEN + ALLOW_IP_LEN;
+pub const SPA_INNER_LEN: usize = SPA_INNER_SIGNED_LEN + SIGNATURE_LEN;
 
+// --- Sealed SPA on-wire layout ---
+//
+// ephemeral X25519 public key | AEAD ciphertext (== SPA_INNER_LEN) | Poly1305 tag | padding
+pub const SPA_EPHEMERAL_LEN: usize = 32;
+pub const SPA_AEAD_TAG_LEN: usize = 16;
+/// Fixed-size sealed core, before any length-jitter padding.
+pub const SPA_SEALED_CORE_LEN: usize = SPA_EPHEMERAL_LEN + SPA_INNER_LEN + SPA_AEAD_TAG_LEN;
+
+/// Minimum on-wire SPA length (sealed core, no padding).
+pub const SPA_MIN_LEN: usize = SPA_SEALED_CORE_LEN;
+/// Maximum on-wire SPA length (sealed core + max padding).
+pub const SPA_MAX_LEN: usize = 176;
+/// Maximum random padding appended after the sealed core for length jitter.
+pub const SPA_MAX_PADDING: usize = SPA_MAX_LEN - SPA_MIN_LEN;
+
+// spa_flags bits (inside the sealed inner record):
+//   bit 0: transport mode (0 = UDP, 1 = HTTPS)
+//   bit 1: source-IP mode (0 = honor signed allow_ip, 1 = use observed packet source)
 pub const SPA_FLAG_HTTPS: u8 = 0b0000_0001;
-pub const SPA_RESERVED_FLAGS: u8 = !SPA_FLAG_HTTPS;
+pub const SPA_FLAG_USE_PACKET_SOURCE: u8 = 0b0000_0010;
+pub const SPA_RESERVED_FLAGS: u8 = !(SPA_FLAG_HTTPS | SPA_FLAG_USE_PACKET_SOURCE);
 
 pub const PROTOCOL_SOCKS5: u8 = 0x05;
 pub const PROTOCOL_GHOST_RELAY: u8 = 0x47;

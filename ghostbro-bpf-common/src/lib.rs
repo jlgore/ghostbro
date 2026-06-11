@@ -1,11 +1,11 @@
 #![no_std]
 
 pub const KEY_ID_LEN: usize = 8;
-pub const SPA_MAX_LEN: usize = 128;
-pub const SPA_MIN_LEN: usize = 107;
-pub const SPA_VERSION_PREFIX: [u8; 2] = [0x47, 0x50];
-pub const SPA_FLAG_HTTPS: u8 = 0b0000_0001;
-pub const SPA_RESERVED_FLAGS: u8 = !SPA_FLAG_HTTPS;
+// Sealed SPA on-wire sizes (must match ghostbro-common::protocol). The XDP layer
+// only pre-filters by length now — the payload is sealed, so there is no
+// cleartext magic or flags to inspect.
+pub const SPA_MAX_LEN: usize = 176;
+pub const SPA_MIN_LEN: usize = 143;
 
 pub const DEFAULT_SPA_PORT: u16 = 53;
 pub const DEFAULT_PROXY_PORT: u16 = 8443;

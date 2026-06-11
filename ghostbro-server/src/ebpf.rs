@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env, mem,
+    net::Ipv4Addr,
     path::Path,
     sync::mpsc,
     sync::{Arc, RwLock},
@@ -35,6 +36,7 @@ pub type AllowedSources = Arc<RwLock<HashMap<u32, AllowedSource>>>;
 pub struct AllowedSource {
     pub entry: AllowEntry,
     pub noise_public_key: [u8; 32],
+    pub max_concurrent_sessions: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -104,7 +106,7 @@ impl EbpfRuntime {
         authorized_keys_path: String,
     ) -> Result<()> {
         let (reload_tx, reload_rx) = mpsc::channel();
-        let _watcher = if env::var_os("GHOST_PROXY_DISABLE_AUTH_WATCH").is_some() {
+        let _watcher = if env::var_os("GHOSTBRO_DISABLE_AUTH_WATCH").is_some() {
             tracing::warn!(authorized_keys_path, "AUTHORIZED_KEYS_WATCH_DISABLED");
             None
         } else {
@@ -144,7 +146,7 @@ impl EbpfRuntime {
                 }
 
                 let payload = &event.payload[..payload_len];
-                match verifier.verify(payload, wall_clock_now_ms()?) {
+                match verifier.verify(payload, Ipv4Addr::from(event.src_ip), wall_clock_now_ms()?) {
                     Ok(accept) => {
                         self.allow_source(event.src_ip, &accept, allow_ttl_seconds)?;
                         tracing::info!(
@@ -171,7 +173,11 @@ impl EbpfRuntime {
 
             while let Ok(candidate) = https_spa_rx.try_recv() {
                 processed += 1;
-                match verifier.verify(&candidate.payload, wall_clock_now_ms()?) {
+                match verifier.verify(
+                    &candidate.payload,
+                    Ipv4Addr::from(candidate.src_ip),
+                    wall_clock_now_ms()?,
+                ) {
                     Ok(accept) => {
                         self.allow_source(candidate.src_ip, &accept, allow_ttl_seconds)?;
                         tracing::info!(
@@ -245,6 +251,7 @@ impl EbpfRuntime {
                 AllowedSource {
                     entry,
                     noise_public_key: accept.noise_public_key,
+                    max_concurrent_sessions: accept.max_concurrent_sessions,
                 },
             );
 
@@ -472,6 +479,7 @@ mod tests {
                     _pad: 0,
                 },
                 noise_public_key: [1u8; 32],
+                max_concurrent_sessions: None,
             },
         );
         sources.insert(
@@ -484,6 +492,7 @@ mod tests {
                     _pad: 0,
                 },
                 noise_public_key: [2u8; 32],
+                max_concurrent_sessions: None,
             },
         );
 
