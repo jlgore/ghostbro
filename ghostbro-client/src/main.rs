@@ -34,6 +34,7 @@ use ghostbro_common::{
     },
     seal::SealTransport,
     spa::{SpaAllowIp, SpaMode, SpaPacket},
+    tunnel::{client_tunnel_handshake, parse_record_header, TunnelCipher, RECORD_HEADER_LEN},
 };
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use serde::{Deserialize, Serialize};
@@ -1322,14 +1323,17 @@ fn connect_once(
             spa_authorization_hint()
         )
     })?;
+    // This dev/one-shot echo path always uses the raw transport (the obfuscated
+    // transport is driven through `connect`/`enroll` config, §14).
+    let mut codec = OuterCodec::raw();
     // Noise XK initiator: write msg1 (e), read msg2 (e, ee), write msg3 (s, se).
     let mut buf = vec![0u8; 16 * 1024];
     let len = noise
         .write_message(&[], &mut buf)
         .context("failed to write Noise XK message 1")?;
-    write_frame(&mut stream, &buf[..len])?;
+    write_frame(&mut stream, &mut codec.send, &buf[..len])?;
 
-    let msg2 = read_frame(&mut stream)?;
+    let msg2 = read_frame(&mut stream, &mut codec.recv)?;
     noise
         .read_message(&msg2, &mut buf)
         .context("failed to read Noise XK message 2")?;
@@ -1337,7 +1341,7 @@ fn connect_once(
     let len = noise
         .write_message(&[], &mut buf)
         .context("failed to write Noise XK message 3")?;
-    write_frame(&mut stream, &buf[..len])?;
+    write_frame(&mut stream, &mut codec.send, &buf[..len])?;
 
     let mut transport = noise
         .into_transport_mode()
@@ -1350,9 +1354,9 @@ fn connect_once(
     let len = transport
         .write_message(message.as_bytes(), &mut buf)
         .context("failed to encrypt application frame")?;
-    write_frame(&mut stream, &buf[..len])?;
+    write_frame(&mut stream, &mut codec.send, &buf[..len])?;
 
-    let encrypted = read_frame(&mut stream)?;
+    let encrypted = read_frame(&mut stream, &mut codec.recv)?;
     let len = transport
         .read_message(&encrypted, &mut buf)
         .context("failed to decrypt echo frame")?;
@@ -1375,7 +1379,7 @@ fn connect_socks5_once(
     counter_file: Option<&str>,
 ) -> Result<()> {
     let server_public_key = read_noise_public_key(server_key)?;
-    let (mut stream, mut transport, mut buf, key_id) = connect_noise(
+    let (mut stream, mut transport, mut buf, key_id, mut codec) = connect_noise(
         identity_key,
         &server_public_key,
         spa_endpoint,
@@ -1388,15 +1392,21 @@ fn connect_socks5_once(
         SealTransport::Raw,
     )?;
 
-    write_encrypted_frame(&mut stream, &mut transport, &[0x05, 0x01, 0x00], &mut buf)?;
-    let method = read_encrypted_frame(&mut stream, &mut transport, &mut buf)?;
+    write_encrypted_frame(
+        &mut stream,
+        &mut transport,
+        &mut codec.send,
+        &[0x05, 0x01, 0x00],
+        &mut buf,
+    )?;
+    let method = read_encrypted_frame(&mut stream, &mut transport, &mut codec.recv, &mut buf)?;
     if method != [0x05, 0x00] {
         anyhow::bail!("unexpected SOCKS5 method response: {method:?}");
     }
 
     let request = socks5_connect_request(target)?;
-    write_encrypted_frame(&mut stream, &mut transport, &request, &mut buf)?;
-    let response = read_encrypted_frame(&mut stream, &mut transport, &mut buf)?;
+    write_encrypted_frame(&mut stream, &mut transport, &mut codec.send, &request, &mut buf)?;
+    let response = read_encrypted_frame(&mut stream, &mut transport, &mut codec.recv, &mut buf)?;
     if response.len() < 2 || response[0] != 0x05 || response[1] != 0x00 {
         anyhow::bail!("SOCKS5 CONNECT failed: {response:?}");
     }
@@ -1406,8 +1416,14 @@ fn connect_socks5_once(
         key_id_hex(&key_id)
     );
 
-    write_encrypted_frame(&mut stream, &mut transport, message.as_bytes(), &mut buf)?;
-    let echoed = read_encrypted_frame(&mut stream, &mut transport, &mut buf)?;
+    write_encrypted_frame(
+        &mut stream,
+        &mut transport,
+        &mut codec.send,
+        message.as_bytes(),
+        &mut buf,
+    )?;
+    let echoed = read_encrypted_frame(&mut stream, &mut transport, &mut codec.recv, &mut buf)?;
     let echoed = String::from_utf8_lossy(&echoed);
     println!(
         "SOCKS5_FRAME_ROUND_TRIP bytes={} message={:?}",
@@ -1428,7 +1444,7 @@ fn connect_ghost_relay_once(
     counter_file: Option<&str>,
 ) -> Result<()> {
     let server_public_key = read_noise_public_key(server_key)?;
-    let (mut stream, mut transport, mut buf, key_id) = connect_noise(
+    let (mut stream, mut transport, mut buf, key_id, mut codec) = connect_noise(
         identity_key,
         &server_public_key,
         spa_endpoint,
@@ -1444,10 +1460,11 @@ fn connect_ghost_relay_once(
     write_encrypted_frame(
         &mut stream,
         &mut transport,
+        &mut codec.send,
         &[PROTOCOL_GHOST_RELAY, GHOST_RELAY_VERSION, 0xff],
         &mut buf,
     )?;
-    let response = read_encrypted_frame(&mut stream, &mut transport, &mut buf)?;
+    let response = read_encrypted_frame(&mut stream, &mut transport, &mut codec.recv, &mut buf)?;
     if response.len() < 3
         || response[0] != PROTOCOL_GHOST_RELAY
         || response[2] != GHOST_RELAY_STATUS_UNSUPPORTED
@@ -1677,7 +1694,7 @@ fn run_relay_request(
     request: &[u8],
 ) -> Result<Vec<u8>> {
     let server_public_key = read_noise_public_key(server_key)?;
-    let (mut stream, mut transport, mut buf, _) = connect_noise(
+    let (mut stream, mut transport, mut buf, _, mut codec) = connect_noise(
         identity_key,
         &server_public_key,
         spa_endpoint,
@@ -1689,8 +1706,8 @@ fn run_relay_request(
         // transport is driven through `enroll`/`connect` config (§14).
         SealTransport::Raw,
     )?;
-    write_encrypted_frame(&mut stream, &mut transport, request, &mut buf)?;
-    read_encrypted_frame(&mut stream, &mut transport, &mut buf)
+    write_encrypted_frame(&mut stream, &mut transport, &mut codec.send, request, &mut buf)?;
+    read_encrypted_frame(&mut stream, &mut transport, &mut codec.recv, &mut buf)
 }
 
 fn relay_request(op: u8) -> Vec<u8> {
@@ -1883,7 +1900,7 @@ fn handle_local_socks5(
     counter_lock: &Arc<Mutex<()>>,
     active_candidate: &Arc<Mutex<Option<usize>>>,
 ) -> Result<()> {
-    let (local_stream, proxy_stream, transport, target, key_id, proxy_endpoint) =
+    let (local_stream, proxy_stream, transport, target, key_id, proxy_endpoint, codec) =
         negotiate_local_socks5_tunnel(
             local_stream,
             identity_key,
@@ -1898,7 +1915,7 @@ fn handle_local_socks5(
         "SOCKS5_TUNNEL_OPEN endpoint={proxy_endpoint} target={target} key_id={}",
         key_id_hex(&key_id)
     );
-    relay_local_socks5(local_stream, proxy_stream, transport)?;
+    relay_local_socks5(local_stream, proxy_stream, transport, codec)?;
     println!("SOCKS5_TUNNEL_CLOSED target={target}");
 
     Ok(())
@@ -1920,6 +1937,7 @@ fn negotiate_local_socks5_tunnel(
     String,
     ghostbro_common::keys::KeyId,
     SocketAddr,
+    OuterCodec,
 )> {
     local_stream
         .set_nonblocking(true)
@@ -1956,7 +1974,15 @@ fn negotiate_local_socks5_tunnel(
                 .context("failed to encode local SOCKS5 target")?,
         );
 
-        let (mut proxy_stream, mut transport, mut buf, key_id, candidate_index, proxy_endpoint) = {
+        let (
+            mut proxy_stream,
+            mut transport,
+            mut buf,
+            key_id,
+            candidate_index,
+            proxy_endpoint,
+            mut codec,
+        ) = {
             let _counter_guard = counter_lock.lock().expect("counter lock poisoned");
             connect_noise_with_failover(identity_key, candidates, policy, counter_file)?
         };
@@ -1967,10 +1993,12 @@ fn negotiate_local_socks5_tunnel(
         write_encrypted_frame(
             &mut proxy_stream,
             &mut transport,
+            &mut codec.send,
             &[0x05, 0x01, 0x00],
             &mut buf,
         )?;
-        let method = read_encrypted_frame(&mut proxy_stream, &mut transport, &mut buf)?;
+        let method =
+            read_encrypted_frame(&mut proxy_stream, &mut transport, &mut codec.recv, &mut buf)?;
         if method != [0x05, 0x00] {
             proto
                 .reply_error(&ReplyError::GeneralFailure)
@@ -1979,8 +2007,15 @@ fn negotiate_local_socks5_tunnel(
             anyhow::bail!("unexpected remote SOCKS5 method response: {method:?}");
         }
 
-        write_encrypted_frame(&mut proxy_stream, &mut transport, &request, &mut buf)?;
-        let response = read_encrypted_frame(&mut proxy_stream, &mut transport, &mut buf)?;
+        write_encrypted_frame(
+            &mut proxy_stream,
+            &mut transport,
+            &mut codec.send,
+            &request,
+            &mut buf,
+        )?;
+        let response =
+            read_encrypted_frame(&mut proxy_stream, &mut transport, &mut codec.recv, &mut buf)?;
         if response.len() < 2 || response[0] != 0x05 || response[1] != 0x00 {
             proto
                 .reply_error(&socks5_reply_error(&response))
@@ -2006,6 +2041,7 @@ fn negotiate_local_socks5_tunnel(
             target_label,
             key_id,
             proxy_endpoint,
+            codec,
         ))
     })
 }
@@ -2027,6 +2063,7 @@ fn relay_local_socks5(
     local_stream: TcpStream,
     proxy_stream: TcpStream,
     transport: snow::TransportState,
+    codec: OuterCodec,
 ) -> Result<()> {
     let mut local_reader = local_stream
         .try_clone()
@@ -2037,6 +2074,12 @@ fn relay_local_socks5(
         .context("failed to clone proxy stream")?;
     let mut proxy_writer = proxy_stream;
     let transport = Arc::new(Mutex::new(transport));
+    // The outer codec has no shared mutable state between directions, so each
+    // relay thread owns its half (send for client→proxy, recv for proxy→client).
+    let OuterCodec {
+        send: mut codec_send,
+        recv: mut codec_recv,
+    } = codec;
 
     let client_transport = transport.clone();
     let client_to_proxy = thread::spawn(move || -> Result<usize> {
@@ -2053,6 +2096,7 @@ fn relay_local_socks5(
             write_encrypted_frame_locked(
                 &mut proxy_writer,
                 &client_transport,
+                &mut codec_send,
                 &read_buf[..len],
                 &mut noise_buf,
             )?;
@@ -2065,9 +2109,12 @@ fn relay_local_socks5(
     let proxy_to_client = thread::spawn(move || -> Result<usize> {
         let mut total = 0usize;
         let mut noise_buf = vec![0u8; 16 * 1024];
-        while let Some(plaintext) =
-            read_encrypted_frame_optional_locked(&mut proxy_reader, &transport, &mut noise_buf)?
-        {
+        while let Some(plaintext) = read_encrypted_frame_optional_locked(
+            &mut proxy_reader,
+            &transport,
+            &mut codec_recv,
+            &mut noise_buf,
+        )? {
             if plaintext.is_empty() {
                 break;
             }
@@ -2108,6 +2155,7 @@ fn connect_noise(
     snow::TransportState,
     Vec<u8>,
     ghostbro_common::keys::KeyId,
+    OuterCodec,
 )> {
     let server_static_pubkey: [u8; 32] = server_public_key
         .try_into()
@@ -2142,14 +2190,33 @@ fn connect_noise(
             spa_authorization_hint()
         )
     })?;
+
+    // Outer obfuscation layer (§5.4, §14). On the obfuscated transport the client
+    // sends a 32-byte Elligator2 representative first (the uniform preamble), then
+    // wraps every frame — Noise handshake included — in a TLS-mimic record. Raw
+    // keeps the v0.3 length framing on both directions.
+    let mut codec = match transport {
+        SealTransport::Raw => OuterCodec::raw(),
+        SealTransport::Obfuscated => {
+            let client_tunnel = client_tunnel_handshake(&server_static_pubkey);
+            stream
+                .write_all(&client_tunnel.representative)
+                .context("failed to write obfuscation preamble")?;
+            OuterCodec {
+                send: OuterDir::Obf(client_tunnel.send),
+                recv: OuterDir::Obf(client_tunnel.recv),
+            }
+        }
+    };
+
     // Noise XK initiator: write msg1 (e), read msg2 (e, ee), write msg3 (s, se).
     let mut buf = vec![0u8; 16 * 1024];
     let len = noise
         .write_message(&[], &mut buf)
         .context("failed to write Noise XK message 1")?;
-    write_frame(&mut stream, &buf[..len])?;
+    write_frame(&mut stream, &mut codec.send, &buf[..len])?;
 
-    let msg2 = read_frame(&mut stream)?;
+    let msg2 = read_frame(&mut stream, &mut codec.recv)?;
     noise
         .read_message(&msg2, &mut buf)
         .context("failed to read Noise XK message 2")?;
@@ -2157,7 +2224,7 @@ fn connect_noise(
     let len = noise
         .write_message(&[], &mut buf)
         .context("failed to write Noise XK message 3")?;
-    write_frame(&mut stream, &buf[..len])?;
+    write_frame(&mut stream, &mut codec.send, &buf[..len])?;
 
     let transport = noise
         .into_transport_mode()
@@ -2167,9 +2234,13 @@ fn connect_noise(
         key_id_hex(&key_id)
     );
 
-    Ok((stream, transport, buf, key_id))
+    Ok((stream, transport, buf, key_id, codec))
 }
 
+// The connection result bundles the stream, Noise transport, scratch buffer,
+// key_id, selected-candidate index, endpoint, and outer codec; a struct would not
+// aid the reader for a value this short-lived.
+#[allow(clippy::type_complexity)]
 fn connect_noise_with_failover(
     identity_key: &str,
     candidates: &[ResolvedConnectConfig],
@@ -2182,6 +2253,7 @@ fn connect_noise_with_failover(
     ghostbro_common::keys::KeyId,
     usize,
     SocketAddr,
+    OuterCodec,
 )> {
     if candidates.is_empty() {
         anyhow::bail!("no server candidates configured");
@@ -2205,7 +2277,7 @@ fn connect_noise_with_failover(
                 counter_file,
                 candidate.transport,
             ) {
-                Ok((stream, transport, buf, key_id)) => {
+                Ok((stream, transport, buf, key_id, codec)) => {
                     if !(round == 0 && position == 0) {
                         println!(
                             "CONNECT_FAILOVER_SELECTED endpoint={} index={index} round={round} strategy={:?}",
@@ -2219,6 +2291,7 @@ fn connect_noise_with_failover(
                         key_id,
                         index,
                         candidate.proxy_endpoint,
+                        codec,
                     ));
                 }
                 Err(error) => {
@@ -2371,12 +2444,41 @@ fn socks5_connect_request(target: &str) -> Result<Vec<u8>> {
     Ok(request)
 }
 
+/// One direction of the proxy tunnel's outer framing (§5.4). `Raw` is the v0.3
+/// 2-byte-length wire format — default, byte-for-byte unchanged. `Obf` wraps each
+/// frame in a TLS-application-data-mimic record sealed by the outer obfuscation
+/// layer (§14, Phase 2); the contained [`TunnelCipher`] carries the per-direction
+/// key and record counter.
+enum OuterDir {
+    Raw,
+    Obf(TunnelCipher),
+}
+
+/// Both framing directions for a single proxy connection. The handshake and the
+/// one-shot helpers run on one stream, so they hold both halves; the SOCKS5 relay
+/// splits them across its two directional threads (each direction has an
+/// independent key + counter, so no shared lock is needed for the outer layer).
+struct OuterCodec {
+    send: OuterDir,
+    recv: OuterDir,
+}
+
+impl OuterCodec {
+    fn raw() -> Self {
+        Self {
+            send: OuterDir::Raw,
+            recv: OuterDir::Raw,
+        }
+    }
+}
+
 fn read_encrypted_frame(
     stream: &mut TcpStream,
     transport: &mut snow::TransportState,
+    codec: &mut OuterDir,
     buf: &mut [u8],
 ) -> Result<Vec<u8>> {
-    let encrypted = read_frame(stream)?;
+    let encrypted = read_frame(stream, codec)?;
     let len = transport
         .read_message(&encrypted, buf)
         .context("failed to decrypt Noise application frame")?;
@@ -2386,21 +2488,23 @@ fn read_encrypted_frame(
 fn write_encrypted_frame(
     stream: &mut TcpStream,
     transport: &mut snow::TransportState,
+    codec: &mut OuterDir,
     plaintext: &[u8],
     buf: &mut [u8],
 ) -> Result<()> {
     let len = transport
         .write_message(plaintext, buf)
         .context("failed to encrypt Noise application frame")?;
-    write_frame(stream, &buf[..len])
+    write_frame(stream, codec, &buf[..len])
 }
 
 fn read_encrypted_frame_optional_locked(
     stream: &mut TcpStream,
     transport: &Arc<Mutex<snow::TransportState>>,
+    codec: &mut OuterDir,
     buf: &mut [u8],
 ) -> Result<Option<Vec<u8>>> {
-    let Some(encrypted) = read_frame_optional(stream)? else {
+    let Some(encrypted) = read_frame_optional(stream, codec)? else {
         return Ok(None);
     };
     let len = {
@@ -2415,6 +2519,7 @@ fn read_encrypted_frame_optional_locked(
 fn write_encrypted_frame_locked(
     stream: &mut TcpStream,
     transport: &Arc<Mutex<snow::TransportState>>,
+    codec: &mut OuterDir,
     plaintext: &[u8],
     buf: &mut [u8],
 ) -> Result<()> {
@@ -2424,7 +2529,7 @@ fn write_encrypted_frame_locked(
             .write_message(plaintext, buf)
             .context("failed to encrypt Noise application frame")?
     };
-    write_frame(stream, &buf[..len])
+    write_frame(stream, codec, &buf[..len])
 }
 
 fn read_noise_public_key(path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -2461,36 +2566,72 @@ fn decode_noise_public_key(encoded: &str) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    read_frame_optional(stream)?.context("connection closed while reading frame length")
+fn read_frame(stream: &mut TcpStream, codec: &mut OuterDir) -> Result<Vec<u8>> {
+    read_frame_optional(stream, codec)?.context("connection closed while reading frame header")
 }
 
-fn read_frame_optional(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
-    let mut len = [0u8; 2];
-    if let Err(error) = stream.read_exact(&mut len) {
-        if error.kind() == ErrorKind::UnexpectedEof {
-            return Ok(None);
+fn read_frame_optional(stream: &mut TcpStream, codec: &mut OuterDir) -> Result<Option<Vec<u8>>> {
+    match codec {
+        OuterDir::Raw => {
+            let mut len = [0u8; 2];
+            if let Err(error) = stream.read_exact(&mut len) {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                }
+                return Err(error).context("failed to read frame length");
+            }
+            let len = usize::from(u16::from_be_bytes(len));
+            let mut frame = vec![0u8; len];
+            stream
+                .read_exact(&mut frame)
+                .context("failed to read frame")?;
+            Ok(Some(frame))
         }
-        return Err(error).context("failed to read frame length");
+        OuterDir::Obf(cipher) => {
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            if let Err(error) = stream.read_exact(&mut header) {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                }
+                return Err(error).context("failed to read obfuscated record header");
+            }
+            let body_len =
+                parse_record_header(&header).context("invalid obfuscated record header")?;
+            let mut body = vec![0u8; body_len];
+            stream
+                .read_exact(&mut body)
+                .context("failed to read obfuscated record body")?;
+            cipher
+                .open_record(&body)
+                .context("failed to open obfuscated record")
+                .map(Some)
+        }
     }
-    let len = usize::from(u16::from_be_bytes(len));
-    let mut frame = vec![0u8; len];
-    stream
-        .read_exact(&mut frame)
-        .context("failed to read frame")?;
-    Ok(Some(frame))
 }
 
-fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> Result<()> {
-    let len: u16 = frame
-        .len()
-        .try_into()
-        .context("frame too large for 2-byte length")?;
-    stream
-        .write_all(&len.to_be_bytes())
-        .context("failed to write frame length")?;
-    stream.write_all(frame).context("failed to write frame")?;
-    Ok(())
+fn write_frame(stream: &mut TcpStream, codec: &mut OuterDir, frame: &[u8]) -> Result<()> {
+    match codec {
+        OuterDir::Raw => {
+            let len: u16 = frame
+                .len()
+                .try_into()
+                .context("frame too large for 2-byte length")?;
+            stream
+                .write_all(&len.to_be_bytes())
+                .context("failed to write frame length")?;
+            stream.write_all(frame).context("failed to write frame")?;
+            Ok(())
+        }
+        OuterDir::Obf(cipher) => {
+            let record = cipher
+                .seal_record(frame)
+                .context("obfuscated frame exceeds maximum length")?;
+            stream
+                .write_all(&record)
+                .context("failed to write obfuscated record")?;
+            Ok(())
+        }
+    }
 }
 
 fn prompt_new_passphrase() -> Result<String> {
