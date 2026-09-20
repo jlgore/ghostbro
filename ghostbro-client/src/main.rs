@@ -84,9 +84,9 @@ enum Command {
         spa_mode: SpaTransport,
         #[arg(long)]
         spa_port: u16,
-        /// Sealed-SPA ephemeral wire encoding (§14): `raw` (default) or
-        /// `obfuscated` (Elligator2-uniform). Must match the server's
-        /// `[spa] transport`.
+        /// Wire encoding (§4.3/§5.4/§14): `raw` (default) or `obfuscated`
+        /// (Elligator2-uniform). Governs both the sealed SPA packet and the
+        /// proxy tunnel. Must match the server's `[spa] transport`.
         #[arg(long, value_enum, default_value_t = TransportArg::Raw)]
         transport: TransportArg,
         /// Output TOML path for the enrolled server config.
@@ -116,8 +116,9 @@ enum Command {
         /// SPA transport mode for the authorization packet.
         #[arg(long)]
         spa_mode: Option<SpaTransport>,
-        /// Override the sealed-SPA ephemeral wire encoding (§14) for every
-        /// candidate. Defaults to the per-server config value (raw if unset).
+        /// Override the wire encoding (§4.3/§5.4/§14) for every candidate —
+        /// governs both the sealed SPA packet and the proxy tunnel. Defaults
+        /// to the per-server config value (raw if unset).
         #[arg(long, value_enum)]
         transport: Option<TransportArg>,
         /// HTTPS SPA endpoint URL, e.g. https://example.com/api/v1/telemetry.
@@ -387,7 +388,7 @@ enum SpaTransport {
     Https,
 }
 
-/// CLI surface for the sealed-SPA ephemeral wire encoding (§4.3, §14). Converts
+/// CLI surface for the wire encoding (§4.3/§5.4/§14) — sealed SPA + tunnel. Converts
 /// to [`SealTransport`]; the config persists `SealTransport` directly. Renders as
 /// `raw` / `obfuscated` on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -435,7 +436,7 @@ struct ServerConfigEntry {
     spa_port: u16,
     server_public_key: String,
     priority: Option<u32>,
-    /// Sealed-SPA ephemeral wire encoding (§4.3, §14). Omitted → `raw`
+    /// Wire encoding (§4.3/§5.4/§14) — sealed SPA + tunnel. Omitted → `raw`
     /// (backward-compatible). Must match the server's `[spa] transport`.
     #[serde(default, skip_serializing_if = "is_raw_transport")]
     transport: SealTransport,
@@ -520,7 +521,7 @@ struct ResolvedConnectConfig {
     proxy_endpoint: SocketAddr,
     spa_mode: SpaTransport,
     https_spa_url: Option<String>,
-    /// Sealed-SPA ephemeral wire encoding for this candidate (§14).
+    /// Wire encoding for this candidate (§4.3/§5.4/§14) — sealed SPA + tunnel.
     transport: SealTransport,
 }
 

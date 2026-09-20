@@ -65,6 +65,10 @@ identity = "/etc/ghostbro/server.key"
 
 [spa]
 mode = "both" # "udp", "https", or "both"
+# Deployment-wide wire encoding: "raw" (default) or "obfuscated" (Elligator2-
+# uniform). Governs BOTH the sealed-SPA ephemeral and the proxy-tunnel framing
+# (PRD §4.3/§5.4/§9). Must match the client's per-server `transport`.
+transport = "raw"
 
 [spa.common]
 time_window = 300
@@ -169,8 +173,11 @@ cargo run -p ghostbro-client -- enroll \
   --endpoint 203.0.113.10:8443 \
   --spa-mode udp \
   --spa-port 53 \
+  --transport raw \
   --output ./client/servers.toml
 ```
+
+`--transport` selects the wire encoding (`raw`, the default, or `obfuscated`) and must match the server's `[spa] transport`. It is persisted per server and omitted from `servers.toml` when `raw`, so existing configs stay byte-identical.
 
 For multi-server failover, add more `[[servers]]` entries to `servers.toml`. Lower `priority` values are attempted first.
 
@@ -189,6 +196,7 @@ spa_endpoint = "example.net"
 spa_mode = "https"
 spa_port = 443
 server_public_key = "<base64-backup-server-noise-public-key>"
+transport = "obfuscated"  # omit for "raw"; must match this server's [spa] transport
 priority = 2
 
 [failover]
@@ -216,7 +224,7 @@ cargo run -p ghostbro-client -- connect \
   --listen 127.0.0.1:1080
 ```
 
-The client prompts for the encrypted identity passphrase. Use applications through `socks5://127.0.0.1:1080`.
+The client prompts for the encrypted identity passphrase. Use applications through `socks5://127.0.0.1:1080`. Pass `--transport raw|obfuscated` to `connect` to override the enrolled per-server setting for that run (e.g. for a no-config direct connect).
 
 ## Development Smoke Test
 

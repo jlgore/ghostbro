@@ -137,17 +137,23 @@ impl SpaVerifier {
         }
     }
 
+    /// Replace the authorized clients and return every key whose cached access
+    /// must be purged because the client was removed or its configuration changed.
     pub fn reload_clients(&mut self, clients: Vec<AuthorizedClient>) -> Vec<KeyId> {
-        let old_key_ids: Vec<KeyId> = self.clients.keys().copied().collect();
-        self.clients = clients
+        let clients: HashMap<KeyId, AuthorizedClient> = clients
             .into_iter()
             .map(|client| (client.key_id, client))
             .collect();
 
-        old_key_ids
-            .into_iter()
-            .filter(|key_id| !self.clients.contains_key(key_id))
-            .collect()
+        let invalidated_key_ids = self
+            .clients
+            .iter()
+            .filter_map(|(key_id, old_client)| {
+                (clients.get(key_id) != Some(old_client)).then_some(*key_id)
+            })
+            .collect();
+        self.clients = clients;
+        invalidated_key_ids
     }
 
     pub fn verify(
@@ -575,6 +581,27 @@ mod tests {
         let removed = verifier.reload_clients(vec![second]);
 
         assert_eq!(vec![first_key_id], removed);
+    }
+
+    #[test]
+    fn reload_clients_reports_changed_retained_clients() {
+        let changed_key = generate_ed25519_keypair();
+        let unchanged_key = generate_ed25519_keypair();
+        let original = client_from_key("changed", &changed_key);
+        let unchanged = client_from_key("unchanged", &unchanged_key);
+        let changed_key_id = original.key_id;
+        let mut changed = original.clone();
+        changed.tier = ClientTier::Decoy;
+
+        let mut verifier = SpaVerifier::new(
+            vec![original, unchanged.clone()],
+            300,
+            TEST_SERVER_PRIV,
+            SealTransport::Raw,
+        );
+        let invalidated = verifier.reload_clients(vec![changed, unchanged]);
+
+        assert_eq!(vec![changed_key_id], invalidated);
     }
 
     #[test]

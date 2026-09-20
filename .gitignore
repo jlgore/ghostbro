@@ -10,3 +10,10 @@
 /PATCHES/
 /PATCHES.md
 /PATCHES.json
+
+# security research - never publish
+VULN-FINDINGS.json
+VULN-FINDINGS.md
+THREAT_MODEL.md
+TRIAGE.json
+TRIAGE.md

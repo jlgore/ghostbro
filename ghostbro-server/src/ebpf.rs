@@ -203,8 +203,8 @@ impl EbpfRuntime {
             while reload_rx.try_recv().is_ok() {
                 processed += 1;
                 match reload_authorized_keys(&authorized_keys_path, &mut verifier) {
-                    Ok(removed_key_ids) => {
-                        for key_id in removed_key_ids {
+                    Ok(invalidated_key_ids) => {
+                        for key_id in invalidated_key_ids {
                             self.purge_key_id(&key_id)?;
                         }
                     }
@@ -374,13 +374,13 @@ fn reload_authorized_keys(
 ) -> Result<Vec<KeyId>> {
     let authorized_keys = AuthorizedKeysFile::load(authorized_keys_path)?;
     let clients = authorized_keys.into_clients()?;
-    let removed = verifier.reload_clients(clients);
+    let invalidated = verifier.reload_clients(clients);
     tracing::info!(
-        removed_keys = removed.len(),
+        invalidated_keys = invalidated.len(),
         authorized_keys_path,
         "AUTHORIZED_KEYS_RELOADED"
     );
-    Ok(removed)
+    Ok(invalidated)
 }
 
 fn parse_spa_event(bytes: &[u8]) -> Result<SpaEvent> {

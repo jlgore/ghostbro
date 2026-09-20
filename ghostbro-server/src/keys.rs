@@ -27,7 +27,7 @@ pub enum ClientTier {
     Decoy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthorizedClient {
     pub name: String,
     pub public_key: ed25519_dalek::VerifyingKey,

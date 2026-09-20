@@ -16,11 +16,12 @@ use ghostbro_bpf_common::{
 
 const ETH_HDR_LEN: usize = 14;
 const IPV4_MIN_HDR_LEN: usize = 20;
-const TCP_MIN_HDR_LEN: usize = 20;
+const TCP_PORTS_LEN: usize = 4;
 const UDP_HDR_LEN: usize = 8;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
+const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 
 const CONFIG_INDEX: u32 = 0;
 const RATE_REFILL_NS: u64 = 60_000_000_000;
@@ -80,11 +81,16 @@ fn try_ghostbro_xdp(ctx: XdpContext) -> Result<u32, ()> {
     if ihl < IPV4_MIN_HDR_LEN {
         return Ok(xdp_action::XDP_PASS);
     }
+    let fragment = read_be_u16(data, data_end, ipv4_offset.checked_add(6).ok_or(())?)?;
+    let fragment_offset = fragment & IPV4_FRAGMENT_OFFSET_MASK;
     let proto = read_u8(data, data_end, ipv4_offset.checked_add(9).ok_or(())?)?;
     let src_ip = read_be_u32(data, data_end, ipv4_offset.checked_add(12).ok_or(())?)?;
 
     let transport_offset = ipv4_offset.checked_add(ihl).ok_or(())?;
     match proto {
+        // Later fragments can only reassemble if their offset-zero fragment
+        // was admitted after its destination port was checked below.
+        IP_PROTO_TCP if fragment_offset != 0 => Ok(xdp_action::XDP_PASS),
         IP_PROTO_TCP => handle_tcp(data, data_end, transport_offset, src_ip, config.proxy_port),
         IP_PROTO_UDP if config.spa_mode & SPA_MODE_UDP != 0 => handle_udp(
             ctx_ptr,
@@ -106,8 +112,8 @@ fn handle_tcp(
     src_ip: u32,
     proxy_port: u16,
 ) -> Result<u32, ()> {
-    if !has_bytes(data, data_end, transport_offset, TCP_MIN_HDR_LEN) {
-        return Ok(xdp_action::XDP_PASS);
+    if !has_bytes(data, data_end, transport_offset, TCP_PORTS_LEN) {
+        return Ok(xdp_action::XDP_DROP);
     }
     let dst_port = read_be_u16(data, data_end, transport_offset.checked_add(2).ok_or(())?)?;
     if dst_port != proxy_port {
